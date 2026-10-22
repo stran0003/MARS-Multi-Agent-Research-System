@@ -84,6 +84,17 @@ class Commander:
         self.run_store = run_store or orchestrator.run_store
         self._provider, self._llm_config = select_provider(agent_config) if agent_config else self._resolve_provider()
         self.max_react_steps = _react_step_limit(agent_config.raw) if agent_config else self._resolve_max_react_steps()
+        try:
+            raw_config = agent_config.raw if agent_config else get_agent_config("commander").raw
+        except KeyError:
+            raw_config = {}
+        loop = raw_config.get('loop', {})
+        configured_budget = loop.get('input_token_budget') if isinstance(loop, Mapping) else None
+        if configured_budget is not None:
+            if type(configured_budget) is not int or configured_budget <= 0:
+                raise ValueError('Commander input_token_budget must be a positive integer')
+            self._llm_config = replace(self._llm_config, extra={**self._llm_config.extra,
+                'commander_input_token_budget': configured_budget})
 
     def _resolve_provider(self) -> tuple[LLMProvider, LLMConfig]:
         try:

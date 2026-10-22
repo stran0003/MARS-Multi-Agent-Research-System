@@ -96,3 +96,28 @@ def test_step_exhaustion_names_limit_without_claiming_a_run_failed() -> None:
     reply = _completion_unfinished_reply(verdict)
     assert '12 步' in reply and '任务创建' in reply and '任务启动' in reply and '继续处理' in reply
     assert '失败' not in reply
+
+
+def test_model_capacity_does_not_override_configured_input_budget(tmp_path: Path) -> None:
+    from app.bridge.commander import Commander
+    from app.bridge.orchestrator import Orchestrator
+    from app.harness.llm.model_registry import get_agent_config
+    from app.storage.run_store import RunStore
+
+    agent_config = replace(get_agent_config('commander'), model_provider='local_vllm',
+        base_url='http://127.0.0.1:1/v1', base_url_env='', api_key_env='',
+        raw={'loop': {'input_token_budget': 262144}})
+    commander = Commander(orchestrator=Orchestrator(run_store=RunStore(tmp_path / 'runs')),
+                          agent_config=agent_config)
+    config = replace(commander._llm_config, max_tokens=393216,
+        extra={**commander._llm_config.extra, 'context_window': 1048576})
+    session = CommanderSession('budget-boundary', 'packing-test')
+    _, path = pack_native_commander_messages(session, [Message('user', 'Question')], config, tmp_path)
+    assert path is not None
+    assert json.loads(path.read_text(encoding='utf-8'))['diagnostics']['runtime_context']['budget'] == 262144
+    # A smaller real model window still leaves room for output and margin.
+    config = replace(config, max_tokens=8192, extra={**config.extra, 'context_window': 65536})
+    _, path = pack_native_commander_messages(session, [Message('user', 'Question')], config, tmp_path)
+    assert path is not None
+    budget = json.loads(path.read_text(encoding='utf-8'))['diagnostics']['runtime_context']['budget']
+    assert 24000 < budget < 65536 - 8192

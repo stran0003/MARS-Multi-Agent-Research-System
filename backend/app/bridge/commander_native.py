@@ -227,8 +227,13 @@ def pack_native_commander_messages(session: CommanderSession, messages: list[Mes
     policy = freeze_policy(root)
     state_path = root / 'context/commander_state.json'
     previous = json.loads(state_path.read_text()) if state_path.exists() else session.context_compaction
-    budget = input_budget(policy, int(policy['input_budget']), output_reserve=config.max_tokens,
-                          model_window=config.extra.get('context_window'))
+    configured_budget = config.extra.get('commander_input_token_budget', int(policy['input_budget']))
+    if type(configured_budget) is not int or configured_budget <= 0:
+        raise ValueError('Commander input_token_budget must be a positive integer')
+    # A model's advertised capacity is a ceiling, not permission to enlarge
+    # the user's configured input budget (e.g. 256K on a 1M-capable endpoint).
+    budget = min(configured_budget, input_budget(policy, configured_budget,
+        output_reserve=config.max_tokens, model_window=config.extra.get('context_window')))
     defaults = json.loads((Path(__file__).parent / 'prompts/commander_runtime.json').read_text(encoding='utf-8'))
     working = config.extra.get('working_context_tokens', defaults['working_context_tokens'])
     if working is not None:

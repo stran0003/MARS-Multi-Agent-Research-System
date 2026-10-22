@@ -134,7 +134,8 @@ pathlib.Path(os.environ['MARS_RESULT_PATH']).write_text(json.dumps(result),encod
     orch = Orchestrator(run_store=RunStore(root / 'research'), registry=registry)
     task = ('Fix add(a,b) in main.py to return the correct sum. Preserve tests. Implement add only initially; '
         'do not invent additional compatibility aliases unless a real execution failure requests one. '
-        'Read main.py and tests/test_main.py with MARS and run code.test_runner command_id=repo-tests. '
+        'Read main.py and tests/test_main.py with native Read and fix main.py with native Edit; '
+        'run code.test_runner command_id=repo-tests. '
         'Deliver accurate code_spec.v1 and exactly one execution_jobs item named arithmetic_seed42, '
         'config={command_id: arithmetic, entrypoint: main.py, seed: 42, budget_unit: steps, budget_steps: 1}. '
         'There is no external data or configuration file: the host adapter measures actual integer pairs. '
@@ -162,6 +163,10 @@ pathlib.Path(os.environ['MARS_RESULT_PATH']).write_text(json.dumps(result),encod
         assert any(k.startswith('execution_attempt_') and v == NodeState.DONE for k, v in states.items()), states
         assert len(passed) >= 2 and len({s['session_id'] for s in passed}) == 1
         assert all(audit_trace(p.parent)['consistent'] for p in checkpoints)
+        native_receipts = [json.loads(line) for checkpoint in checkpoints
+            for line in (checkpoint.parent / 'events.jsonl').read_text(encoding='utf-8').splitlines()
+            if json.loads(line).get('kind') == 'native_write_receipt']
+        assert native_receipts, 'No actual native ZCode file change was recorded'
         tool_events = [json.loads(line) for line in
                        (session.run.root / 'events/tool_events.jsonl').read_text(encoding='utf-8').splitlines()]
         assert any(e.get('tool') == 'code.test_runner' and e.get('ok') is True for e in tool_events)
@@ -183,6 +188,7 @@ pathlib.Path(os.environ['MARS_RESULT_PATH']).write_text(json.dumps(result),encod
         atomic_json(root / 'acceptance.json', {'status': 'passed', 'model': selected.model_name,
             'run_id': session.run.run_id, 'states': {k:v.value for k,v in states.items()}, 'metrics': metrics,
             'session_id': passed[0]['session_id'], 'coding_turns': len(passed), 'baseline_preserved': True,
+            'native_write_receipts': len(native_receipts),
             'report': str(report) if args.with_report else None,
             'scope': ('real CPU coding -> failure -> same-session repair -> execution -> writing; '
                       'not PIM training or idea/experiment research acceptance') if args.with_report else

@@ -521,7 +521,7 @@ tools:
 
   code.delete_file:
     enabled: true
-    description: Delete a project-repo file after human approval.
+    description: Delete a file in the writable research checkout, retaining a rollback snapshot. No separate cleanup approval; project path boundaries still apply.
     mutation_level: write
     allowed_agents: [coding, system, bridge]
     timeout_seconds: 10
@@ -551,6 +551,26 @@ tools:
     output_schema:
       type: object
       required: [rolled_back]
+      additionalProperties: true
+
+  code.prepare_execution:
+    enabled: true
+    description: Record a Python job adapter and YAML in this research checkout without asking the user to register a command. The adapter reads MARS_JOB_REQUEST, consumes config.data_path, handles MARS_VALIDATE_ONLY=1 without training, and writes the actual validation/result protocol to MARS_RESULT_PATH. This prepares a run-local command_id, not approval or a training launch.
+    mutation_level: write
+    allowed_agents: [coding]
+    timeout_seconds: 30
+    input_schema:
+      type: object
+      required: [entrypoint, config_path]
+      additionalProperties: false
+      properties:
+        entrypoint: {type: string, minLength: 1}
+        config_path: {type: string, minLength: 1}
+        required_metrics: {type: array, items: {type: string}}
+        timeout_seconds: {type: number, exclusiveMinimum: 0, description: 'Training wall clock budget; defaults to host prepared_command_timeout_seconds, separate from the no-training checker.'}
+    output_schema:
+      type: object
+      required: [command_id, entrypoint, config_path, training_started]
       additionalProperties: true
 
   code.test_runner:

@@ -159,3 +159,19 @@ async def test_unseeded_optional_execution_hint_does_not_block_real_task_creatio
         assert len(first.run_store.list()) == 1
         assert not (actual.run.root / 'coding/code_spec.approved.md').exists()
         assert not list((actual.run.root / 'execution').glob('**/job.json'))
+
+
+@pytest.mark.asyncio
+async def test_unregistered_existing_model_delegates_to_coding_without_source_read(tmp_path: Path) -> None:
+    with _runtime(tmp_path) as (datasets, first, _other):
+        (tmp_path / 'execution.yaml').write_text('execution:\n  local_commands: []\n')
+        reset_settings_cache()
+        selected = _dataset(datasets, first.session.project, 'uploaded', [2, 4, 8])
+        datasets.set_default(project=first.session.project, source_id=selected['id'])
+        result, actual = await _create(first)
+        assert result['ok'], result
+        assert actual is not None and actual.request.entrypoint == 'coding'
+        assert actual.request.user_request == '运行configs/existing.yaml，2steps，先只准备'
+        assert actual.request.data_source['id'] == selected['id']
+        assert not (actual.run.root / 'coding/code_spec.approved.md').exists()
+        assert not list((actual.run.root / 'execution').glob('**/job.json'))

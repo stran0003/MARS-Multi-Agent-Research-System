@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,8 @@ class ZCodeProtocolError(RuntimeError):
 
 class ZCodeClient:
     def __init__(self, *, command: tuple[str, ...], cwd: Path, env: dict[str, str],
-                 timeout: int, max_line_bytes: int) -> None:
+                 timeout: int, max_line_bytes: int,
+                 permission_handler: Callable[[dict[str, Any]], Awaitable[dict[str, str]]] | None = None) -> None:
         self.command, self.cwd, self.env = command, cwd, env
         self.timeout, self.max_line_bytes = timeout, max_line_bytes
         self.process: asyncio.subprocess.Process | None = None
@@ -27,6 +29,7 @@ class ZCodeClient:
         self.events: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=2048)
         self.write_lock = asyncio.Lock()
         self.last_stderr = ""
+        self.permission_handler = permission_handler
 
     async def start(self) -> None:
         self.process = await start_process((*self.command, "app-server"), cwd=self.cwd, env=self.env,
@@ -76,7 +79,9 @@ class ZCodeClient:
                                   "askUserQuestionAutoResolutionEnabled": False}
                         await self._send({"id": key, "result": result})
                     elif method == "interaction/requestPermission":
-                        await self._send({"id": key, "result": {"decision": "deny", "reason": "MARS tools only"}})
+                        permission = (await self.permission_handler(value.get('params', {})) if self.permission_handler else
+                                  {"decision": "deny", "reason": "MARS tools only"})
+                        await self._send({"id": key, "result": permission})
                     else:
                         await self._send({"id": key, "error": {"code": -32601, "message": "Host capability not granted by MARS"}})
                 elif key in self.pending:

@@ -215,6 +215,13 @@ async def _create_run_with_routing(
     except (OSError, ValueError) as exc:
         return {"ok": False, "status": "selected_data_source_invalid", "error": str(exc)}
     user_request = str(args.get("user_request", ""))
+    # A routing model's paraphrase is not a new user instruction. Preserve the
+    # actual human request so README defaults cannot become scientific constraints.
+    source_messages = _stage_limit_user_sources(ctx.session)
+    if source_messages:
+        user_request = '\n\n'.join(row['content'] for row in source_messages)
+    if entrypoint == 'coding':
+        routing = {**routing, 'inspection_owner': 'coding'}
     seed_artifact = args.get("seed_artifact")
     task = str(args.get("task") or user_request[:60] or "commander_run")
     from app.bridge.commander_existing import existing_execution_stage_limit
@@ -330,6 +337,14 @@ async def _run_existing_model(args: dict[str, Any], ctx: ToolContext) -> dict[st
     except (OSError, UnicodeError, ValueError) as exc:
         return {"ok": False, "status": "existing_model_request_invalid", "error": str(exc)}
     if not resolved["ok"]:
+        if resolved.get('status') in {'execution_registration_required', 'capability_unavailable'}:
+            created = await _create_run({'entrypoint': 'coding',
+                'task': '准备并运行已有模型',
+                'user_request': '\n\n'.join(row['content'] for row in source_messages),
+                'routing_reason': '入口和数据适配由 Coding 在研究副本中准备，无需用户预先登记。'}, ctx)
+            if created.get('ok') and args.get('start', True):
+                return await _start_run({'run_id': created['run_id']}, ctx)
+            return created
         return resolved
     try:
         if not source_messages:
@@ -825,7 +840,7 @@ TOOLS: dict[str, ToolSpec] = {
         handler=lambda args, ctx: _research_memory(args, ctx, True)),
 
     'run.existing_model': ToolSpec(name='run.existing_model',
-        description='Run an already implemented model: call this directly as the only action, without preliminary history lookup or repeated source-reading model turns. The host reads only current registered configurations/entrypoints and always creates Coding→Execution, skipping Idea/Experiment. It resolves a unique actual model/config or returns actual choices; never guesses. Budget steps means optimizer updates, epochs means complete epochs. Omit seed unless the user explicitly supplied it: the host reads declared config defaults or generates and freezes a new seed only under an explicit host policy; never borrow a historical seed. An existing but unregistered config returns execution_registration_required, not missing-model evidence. Explicit parameter overrides use ordinary Coding, preserving their meaning. Creation is not approval or training success. Successful preparation returns a factual terminal receipt; do not request another summary model turn.',
+        description='Run an already implemented model: call this directly as the only action, without preliminary history lookup or repeated source-reading model turns. The host reads only current registered configurations/entrypoints and always creates Coding→Execution, skipping Idea/Experiment. It resolves a unique actual model/config or returns actual choices; never guesses. Budget steps means optimizer updates, epochs means complete epochs. Omit seed unless the user explicitly supplied it: the host reads declared config defaults or generates and freezes a new seed only under an explicit host policy; never borrow a historical seed. An existing but unregistered config delegates preparation to ordinary Coding, not a user registration requirement. Explicit parameter overrides use ordinary Coding, preserving their meaning. Creation is not approval or training success. Successful preparation returns a factual terminal receipt; do not request another summary model turn.',
         parameters={'model_name': 'optional existing model name, exact or an unambiguous abbreviation',
                     'config_path': 'optional exact connected-repository relative configuration path; preferred when known',
                     'entrypoint': 'optional registered relative entrypoint, needed only if more than one matches',
@@ -862,7 +877,7 @@ TOOLS: dict[str, ToolSpec] = {
         handler=_read_context_material, mutation_level="read"),
     "run.create": ToolSpec(
         name="run.create",
-        description="Create without starting. Inspect task-relevant connected source in this turn before choosing entrypoint. For an explicit unchanged existing model/configuration with a supported entrypoint and resolved budget/seed, always pass coding plus existing_execution_job after reading the exact configuration. No history lookup is required: the host checks actual approved delivery and execution receipts plus fresh validation. Old memory summaries, failed short checks or reuse_allowed=false cannot reject this reuse request; they cannot certify it either. The host may generate a fresh validated delivery without Coding model calls; unavailable evidence falls back to ordinary Coding. This does not approve artifacts or start simulation. Do not use it for code changes or new methods. For unrelated tasks explain repository_scope=not_applicable in routing_reason.",
+        description="Create without starting. For implementation, repairs, parameter changes or baseline runs, choose coding immediately from user intent. Coding reads the repository, adapts selected data and prepares the actual entrypoint; Commander need not inspect source or register commands. Preserve the human request without importing README defaults. Optional verified existing_execution_job can reuse an unchanged delivery; otherwise ordinary Coding prepares it. Creation is not approval or simulation success. For unrelated tasks explain repository_scope=not_applicable.",
         parameters={
             "entrypoint": "one of pipeline|idea|experiment|coding|writing; new execution-only runs require coding delivery first",
             "repository_scope": "required (default) or not_applicable for tasks unrelated to code",
@@ -946,10 +961,11 @@ TOOLS: dict[str, ToolSpec] = {
             "Create and immediately start a pipeline/standalone run. For goal-driven continuous Auto Research, "
             "supply evolution with quantitative criteria, six-module code boundaries, matched baseline and budgets; "
             "use pipeline. The host repeats real simulations, checks objectives and constraints, and evolves "
-            "within that frozen contract until replicated success or a declared stop. Use the "
-            "task-relevant source read in this turn to choose the earliest necessary stage. "
+            "within that frozen contract until replicated success or a declared stop. "
+            "For implementation/repairs/baseline runs, choose coding directly from user intent. "
+            "No Commander source-read or command-registration prerequisite: Coding owns source/data/config preparation. "
             "For a NEW existing-model simulation use coding to bind execution delivery; "
-            "for an explicit unchanged configuration and resolved budget/seed, always pass "
+            "for an already verified unchanged configuration and resolved budget/seed, optionally pass "
             "existing_execution_job after reading that exact configuration. No Commander history "
             "lookup is required. Old memory summaries, failed short checks or reuse_allowed=false "
             "neither reject nor certify reuse: the host checks actual receipts and fresh validation. "

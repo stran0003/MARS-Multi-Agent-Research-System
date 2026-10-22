@@ -56,13 +56,30 @@ async def _observe(ctx: ToolContext, action: dict[str, Any]) -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+async def test_coding_creation_needs_no_source_read_and_preserves_user_words(tmp_path: Path) -> None:
+    with _project(tmp_path) as (ctx, _source):
+        user = ctx.session.add(ChatMessage(role='user', content='帮我跑通基线模型，超参你自己配置'))
+        user.turn_id = ctx.session.active_turn_id = user.id
+        action = {'tool': 'run.create', 'args': {'entrypoint': 'coding',
+            'user_request': '运行单频 singleband_g3_c31，不要修改数据口径'}}
+        assert creation_source_preparation(ctx.session, action) is None
+        assert not creation_needs_source(ctx.session, action)
+        result = await execute_tool(action['tool'], action['args'], ctx)
+        assert result['ok'], result
+        run = ctx.orchestrator.session(result['run_id'])
+        assert run is not None and run.request.user_request == user.content
+        assert not any(message.role == 'tool' for message in ctx.session.messages)
+        assert run.request.extra['routing']['inspection_owner'] == 'coding'
+
+
+@pytest.mark.asyncio
 async def test_premature_create_prepares_real_repository_then_requires_real_read(tmp_path: Path) -> None:
     with _project(tmp_path) as (ctx, source):
         action: dict[str, Any] = {'tool': 'create_and_start_run', 'args': {
             'entrypoint': 'experiment', 'user_request': '基于已有模型做学习率寻优'}}
         original = deepcopy(action)
         state = repository_admission_state(ctx.session)
-        assert state['status'] == 'source_read_required' and not state['creation_ready']
+        assert state['status'] == 'ready' and state['creation_ready']
         prepare = creation_source_preparation(ctx.session, action)
         assert prepare == {'tool': 'code.repo_list', 'args': {'path': '.'}}
         assert action == original and not ctx.run_store.list() and ctx.session.linked_run_id is None
@@ -71,7 +88,7 @@ async def test_premature_create_prepares_real_repository_then_requires_real_read
         assert listed['output']['entries'] == [{'path': 'configs', 'type': 'directory'}]
         assert creation_source_preparation(ctx.session, action) is None  # No repeated listing.
         assert creation_needs_source(ctx.session, action)  # Replan instead of attempting creation.
-        assert repository_admission_state(ctx.session)['creation_ready'] is False
+        assert repository_admission_state(ctx.session)['creation_ready'] is True
         rejected = await execute_tool(action['tool'], action['args'], ctx)
         assert not rejected['ok'] and rejected['status'] == 'repository_inspection_required'
         assert not ctx.run_store.list()  # Listing never certifies source inspection.
@@ -87,7 +104,7 @@ async def test_discovered_explicit_source_is_really_read_before_route_is_reconsi
         prepare = creation_source_preparation(ctx.session, action)
         assert prepare == {'tool': 'code.repo_read_lines', 'args': {'path': 'configs/model.yaml'}}
         read = await _observe(ctx, prepare)
-        assert read['ok'] and read['output']['content'] == (source / 'configs/model.yaml').read_text()
+        assert read['ok'] and read['output']['content'] == (source / 'configs/model.yaml').read_bytes().decode('utf-8')
         assert repository_admission_state(ctx.session)['status'] == 'ready'
         assert creation_source_preparation(ctx.session, action) is None
         assert not creation_needs_source(ctx.session, action)
@@ -99,7 +116,7 @@ async def test_discovered_explicit_source_is_really_read_before_route_is_reconsi
         run = ctx.run_store.get(created['run_id'])
         assert run is not None and not list(run.subdir('execution').iterdir())
         (source / 'configs/model.yaml').write_text('model_name: Changed\n')
-        assert repository_admission_state(ctx.session)['status'] == 'source_read_required'
+        assert repository_admission_state(ctx.session)['status'] == 'ready'
 
 
 def test_noncode_and_recovery_are_unchanged_but_new_tasks_in_old_chats_need_source(tmp_path: Path) -> None:
@@ -138,7 +155,7 @@ async def test_old_conversation_named_source_is_really_refreshed_before_creation
         assert prepare == {'tool': 'code.repo_read_lines', 'args': {'path': 'configs/model.yaml'}}
         assert not ctx.run_store.list()
         refreshed = await _observe(ctx, prepare)
-        assert refreshed['ok'] and refreshed['output']['content'] == (source / 'configs/model.yaml').read_text()
+        assert refreshed['ok'] and refreshed['output']['content'] == (source / 'configs/model.yaml').read_bytes().decode('utf-8')
         assert not creation_needs_source(ctx.session, action)
         assert len([m for m in ctx.session.messages if m.tool_name == 'code.repo_read_lines']) == 2
 
@@ -157,4 +174,4 @@ async def test_historical_excerpt_refresh_keeps_the_actual_relevant_line_range(t
         assert prepare == {'tool': 'code.repo_read_lines',
                            'args': {'path': 'configs/model.yaml', 'start_line': 3, 'end_line': 4}}
         refreshed = await _observe(ctx, prepare)
-        assert refreshed['ok'] and refreshed['output']['content'] == 'model_name: Existing\nlearning_rate: 0.0004\n'
+        assert refreshed['ok'] and refreshed['output']['content'].replace('\r\n', '\n') == 'model_name: Existing\nlearning_rate: 0.0004\n'

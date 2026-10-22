@@ -139,7 +139,7 @@ def test_explicit_retry_renews_only_the_confirmation_decision(
     assert original.read_bytes() == receipt
 
 
-def test_confirmation_rechecks_coding_binding_after_approved_plan_changes(
+def test_confirmation_allows_prose_changes_but_rechecks_execution_semantics(
     execution: tuple[Orchestrator, RunSession, Path, Path],
 ) -> None:
     from app.harness.schema.experiment_contract import document_hash
@@ -163,10 +163,14 @@ def test_confirmation_rechecks_coding_binding_after_approved_plan_changes(
     store.approve(store.write(text=dumps(execution_metadata, 'Exact executable intake of the approved protocol.')))
     original = execution_preview(session.run, 'execution')
     assert not original['blockers']
-    store.approve(store.write(text=dumps(plan, 'A changed approved protocol needs coding revalidation.')))
+    store.approve(store.write(text=dumps(plan, 'Rephrased explanation; the executable protocol is unchanged.')))
     changed = execution_preview(session.run, 'execution')
     assert changed['token'] != original['token']
-    assert any('experiment_plan_sha256' in error for error in changed['blockers'])
+    assert not changed['blockers']  # Document hashes alone are no longer an execution gate.
+    plan['ablations'][0]['config']['seed'] = 2027
+    store.approve(store.write(text=dumps(plan, 'An actual approved seed changed.')))
+    changed = execution_preview(session.run, 'execution')
+    assert changed['blockers']
     with pytest.raises(ValueError):
         save_confirmation(session.run, 'execution', changed['token'])
     assert not (session.run.root / 'execution/local_commands').exists()

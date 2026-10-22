@@ -39,6 +39,9 @@ def routing_repository_check(args: dict[str, Any], session: CommanderSession) ->
     except ValueError as exc:
         return {'ok': False, 'status': 'repository_unavailable',
                 'error': f'代码仓绑定无法核验：{exc}。纯非代码任务可明确声明 repository_scope=not_applicable 并说明理由。'}
+    if args.get('entrypoint') == 'coding':
+        return {'ok': True, 'repository_scope': scope, 'reason': reason,
+                'inspection_owner': 'coding', 'evidence': routing_source_evidence(repo, session)}
     evidence = routing_source_evidence(repo, session)
     if not evidence:
         return {'ok': False, 'status': 'repository_inspection_required',
@@ -77,12 +80,8 @@ def repository_admission_state(session: CommanderSession) -> dict[str, Any]:
         evidence = routing_source_evidence(repo, session)
     except (OSError, ValueError) as exc:
         return {'status': 'unavailable', 'reason': str(exc), 'creation_ready': False}
-    return {'status': 'ready' if evidence else 'source_read_required',
-            'creation_ready': bool(evidence), 'evidence': evidence,
-            'next_step': ('根据实际代码选择最早必要阶段。' if evidence else
-                '先用 code.repo_read_lines 读取任务相关的真实模型、配置或入口。'
-                '尚不清楚路径时浏览或搜索实际仓库；不要猜 src 等目录。'
-                '代码任务此时不能创建；纯非代码任务可明确说明 repository_scope=not_applicable。')}
+    return {'status': 'ready', 'creation_ready': True, 'evidence': evidence,
+            'next_step': '明确的实现、修复、运行基线任务直接交给 Coding；源码检查、数据适配和入口准备由 Coding 完成。不要把仓库样例扩写成用户约束。'}
 
 
 def creation_needs_source(session: CommanderSession, action: dict[str, Any]) -> bool:
@@ -106,7 +105,7 @@ def creation_source_preparation(session: CommanderSession, action: dict[str, Any
         return None
     args = action.get('args')
     if (not isinstance(args, dict) or args.get('repository_scope', 'required') != 'required'
-            or args.get('entrypoint') == 'writing'):
+            or args.get('entrypoint') in {'writing', 'coding'}):
         return None
     try:
         repo = load_project_repo(session.project)

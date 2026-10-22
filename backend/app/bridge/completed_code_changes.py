@@ -112,6 +112,9 @@ def _operations(run: RunHandle, record: dict[str, Any], limit: int) -> list[tupl
         return [(path, before, after) for path, before, after in _copy_yaml_operations(run, record, limit)]
     snapshots = _snapshots(run, record, limit)
     args, tool = record["args"], record["tool"]
+    if tool in {'zcode.Write', 'zcode.Edit'}:
+        path = PurePosixPath(args['path'].strip()).as_posix()
+        return [(path, snapshots[path], _snapshots(run, record, limit, key='after_snapshots')[path])]
     if tool in {"code.write_file", "code.delete_file"}:
         path = PurePosixPath(args["path"].strip()).as_posix()
         before = snapshots[path]
@@ -204,7 +207,7 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
             record = json.loads(_read(record_path, run.root, policy["max_record_bytes"]))
             if (record.get("run_id") == run.run_id and record.get("project") == project
                     and record.get("agent") == "coding" and record.get("status") == "success"
-                    and record.get("tool") in {"code.write_file", "code.delete_file", "code.apply_patch", "code.copy_yaml"}):
+                    and record.get("tool") in {"code.write_file", "code.delete_file", "code.apply_patch", "code.copy_yaml", "zcode.Write", "zcode.Edit"}):
                 records.append(record)
         except (OSError, ValueError, AttributeError):
             warnings.append(f"{record_path.name} 无法安全核对。")

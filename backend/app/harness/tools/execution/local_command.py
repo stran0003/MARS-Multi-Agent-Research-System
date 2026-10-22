@@ -116,6 +116,9 @@ def command_supports_project(row: dict[str, Any], project: str) -> bool:
 def _registered_command(job: LocalCommandJob) -> dict[str, Any]:
     cfg = load_execution_config()["execution"]
     rows = cfg.get("local_commands", [])
+    from app.harness.tools.execution.prepared_command import prepared_commands
+    prepared = prepared_commands(job.run_root, job.project, job.run_id)
+    rows = [*(rows if isinstance(rows, list) else []), *prepared]
     declared = job.config.get('command_id')
     if job.command_id and declared and job.command_id != declared:
         raise ValueError('command_id disagrees with the approved job configuration')
@@ -175,7 +178,10 @@ def _command(job: LocalCommandJob, tool_name: str, *, validation: bool = False) 
         raise ValueError('command validation must use the registered execution interpreter')
     argv = tuple(raw)
     allowlist = tool_config(tool_name).command_allowlist
-    if not any(len(argv) >= len(prefix) and argv[:len(prefix)] == prefix for prefix in allowlist if prefix):
+    from app.harness.tools.execution.prepared_command import prepared_commands
+    prepared = prepared_commands(job.run_root, job.project, job.run_id)
+    task_owned = selected in prepared and argv == ('python', '{code_root}/' + str(job.config.get('entrypoint')))
+    if not task_owned and not any(len(argv) >= len(prefix) and argv[:len(prefix)] == prefix for prefix in allowlist if prefix):
         raise ValueError("configured local_command is not allowlisted for " + tool_name)
     from app.harness.tools.git_branch import current_git_branch, receipt_path, saved_branch
     from app.harness.runtime.project_scope import current_project_scope, safe_scope_path
@@ -211,7 +217,7 @@ def _command(job: LocalCommandJob, tool_name: str, *, validation: bool = False) 
     required = selected.get("required_metrics", [])
     if not isinstance(required, list) or any(not isinstance(name, str) or not name for name in required):
         raise ValueError("required_metrics must be a list of metric names")
-    timeout = float(checker['timeout_seconds'] if checker is not None else cfg.get("command_timeout_seconds", 60))
+    timeout = float(checker['timeout_seconds'] if checker is not None else selected.get('timeout_seconds', cfg.get("command_timeout_seconds", 60)))
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("local_command timeout must be positive and finite")
     return argv, tuple(required), timeout
@@ -230,8 +236,10 @@ def command_request(job: LocalCommandJob, invocation_id: str, output_dir: Path) 
     if selected.get('consumes_data_path') is True:
         path_text = config.get('data_path')
         chosen = job.run_root / 'input/selected_data_source.json'
-        if not path_text and chosen.is_file():
+        if chosen.is_file():
             raw = json.loads(chosen.read_text(encoding='utf-8'))
+            if not isinstance(raw, dict) or raw.get('project', job.project) != job.project:
+                raise ValueError('Selected data belongs to another project')
             path_text = raw.get('stored_path') if isinstance(raw, dict) else None
         if path_text:
             if not isinstance(path_text, str):

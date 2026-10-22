@@ -1025,6 +1025,14 @@ def _system_prompt(session: CommanderSession) -> str:
         "admission": repository_admission_state(session), "state": session.state.value,
         "linked_run_id": session.linked_run_id, "auto_mode": session.auto_mode,
         "metric_targets": session.metric_targets}
+    from app.storage.data_source_store import DataSourceStore
+    try:
+        selected = DataSourceStore().default_profile(session.project)
+        if selected and selected.get('project', session.project) == session.project:
+            state['selected_data'] = {key: selected.get(key) for key in ('id', 'original_name', 'shape', 'dict_entries')}
+    except (OSError, ValueError):
+        state['selected_data'] = {'status': 'metadata_unavailable',
+                                  'instruction': '数据概要暂不可读；不要猜测数据或用代码仓样例替代。'}
     return (rules + "\n## 当前上下文\n" + json.dumps(state, ensure_ascii=False)
         + "\n## 项目指令（保留原文）\n" + project_context
         + "\n## 可用工具\n" + tools_for_prompt()

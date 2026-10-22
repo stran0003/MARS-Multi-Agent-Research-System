@@ -8,6 +8,9 @@ execution:
   max_concurrency: 16          # run all 16 ablation cells concurrently (asyncio semaphore)
   batch_steps: 120             # gradient-descent steps per cell (curve resolution + convergence)
   command_timeout_seconds: 60
+  # Coding-prepared training jobs use their own wall clock budget, not the
+  # short utility-command timeout. Coding may declare a task-specific override.
+  prepared_command_timeout_seconds: 86400
   # Each real command stream keeps this disk prefix and this memory tail.
   # Receipts explicitly mark truncated logs and interrupted captures.
   # Log cap: 1024-16777216 bytes; tail: 1-65536 bytes, no larger than log cap.

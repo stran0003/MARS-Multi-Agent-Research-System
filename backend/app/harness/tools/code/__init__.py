@@ -22,6 +22,7 @@ from app.harness.runtime.git_runtime import GitRuntimeError, git_environment, re
 from app.harness.runtime.project_scope import current_project_scope, validated_diff_paths
 from app.harness.tools.config import check_commands, command_timeout_seconds, tool_config
 from app.harness.tools.registry import ToolContext, ToolResult
+from app.harness.tools.code.patch_text import normalize_patch
 from app.harness.tools.process_runtime import communicate_process, start_process
 from app.settings import repo_root
 
@@ -106,7 +107,7 @@ async def repo_reader_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult
 
 async def patch_generator_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     """Generate or normalize a unified diff for a project file."""
-    diff = str(args.get("diff", ""))
+    diff = normalize_patch(str(args.get("diff", "")))
     if diff:
         error = _bound_diff_error(ctx, diff)
         if error:
@@ -185,11 +186,7 @@ async def write_file_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
 
 
 async def delete_file_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-    """Delete a file under the configured project repo.
-
-    The registry normally returns ``requires_approval`` before this function is
-    reached. This implementation is kept for an explicitly approved path.
-    """
+    """Delete a writable project file, preserving a recovery snapshot first."""
     read_only_error = _read_only_error(ctx)
     if read_only_error:
         return ToolResult(ok=False, error=read_only_error)
@@ -208,8 +205,8 @@ async def delete_file_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult
         return ToolResult(ok=False, error=str(exc))
     if ctx.dry_run:
         return ToolResult(ok=True, output={"dry_run": True, "path": rel})
-    target.unlink()
     rollback_ref = _write_rollback(ctx, "code.delete_file", snapshots)
+    target.unlink()
     _record_branch_write(ctx, [rel])
     return ToolResult(ok=True, output={"deleted": rel}, rollback_ref=rollback_ref, evidence_refs=[rel])
 
@@ -224,18 +221,22 @@ async def apply_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult
         payload = _patch_result_payload(ctx, version, applied=False, error=read_only_error)
         _write_patch_result(ctx, version, payload)
         return ToolResult(ok=False, output=payload, error=read_only_error)
-    diff = str(args.get("diff", ""))
+    diff = normalize_patch(str(args.get("diff", "")))
     if not diff and args.get("patch_path"):
         from app.harness.tools.git_branch import current_git_branch
         if (current_project_scope(ctx.project, ctx.run_id) is not None
                 or current_git_branch(ctx.project, ctx.run_id) is not None):
-            return ToolResult(ok=False, error="Bound patches require textual diff; external patch_path is not admitted")
-        patch_path = Path(str(args["patch_path"]))
-        if not patch_path.is_absolute():
-            patch_path = repo_root() / patch_path
+            resolved_patch = _resolve_project_file(ctx, str(args['patch_path']), must_exist=True)
+            if isinstance(resolved_patch, ToolResult):
+                return resolved_patch
+            patch_path = resolved_patch[2]
+        else:
+            patch_path = Path(str(args["patch_path"]))
+            if not patch_path.is_absolute():
+                patch_path = repo_root() / patch_path
         if not patch_path.is_file():
             return ToolResult(ok=False, error=f"patch not found: {patch_path}")
-        diff = patch_path.read_text(encoding="utf-8", errors="replace")
+        diff = normalize_patch(patch_path.read_text(encoding="utf-8", errors="replace"))
     if not diff:
         return ToolResult(ok=False, error="diff or patch_path is required")
     error = _bound_diff_error(ctx, diff)
@@ -486,7 +487,7 @@ async def _git_apply(root: Path, diff: str, *, check_only: bool, isolated: bool 
         executable = resolve_git().executable
     except GitRuntimeError as exc:
         return ToolResult(ok=False, error=str(exc), output={"code": exc.reason["code"]})
-    argv = [executable, "apply", "--whitespace=nowarn"]
+    argv = [executable, "apply", "--whitespace=nowarn", "--recount", "--unidiff-zero"]
     if isolated:
         # Candidate directories may live below the MARS git checkout. Do not
         # discover its index/worktree or honor ambient GIT_WORK_TREE routing.

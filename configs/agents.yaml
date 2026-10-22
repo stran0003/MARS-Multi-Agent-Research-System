@@ -226,6 +226,7 @@ coding:
   - code.delete_file
   - code.rollback_patch
   - code.test_runner
+  - code.prepare_execution
   - code.lint
   - knowledge.code_assets
   - knowledge.research_memory

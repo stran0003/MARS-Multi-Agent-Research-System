@@ -540,6 +540,8 @@ def _install_default_tools(reg: ToolRegistry) -> None:
     reg.register("code.rollback_patch", rollback_patch_tool)
     reg.register("code.test_runner", test_runner_tool)
     reg.register("code.lint", lint_tool)
+    from app.harness.tools.execution.prepared_command import prepare_execution_tool
+    reg.register("code.prepare_execution", prepare_execution_tool)
     # execution.*
     reg.register("execution.simulation_runner", simulation_runner_tool)
     reg.register("execution.batch_runner", batch_runner_tool)
@@ -852,8 +854,6 @@ def _approval_required_reason(
         return f"tool '{tool_name}' requires approval by policy"
     if spec.policy.mutation_level != "write":
         return ""
-    if tool_name == "code.delete_file":
-        return "delete_file requires human approval"
     # Bounded scalar configuration variants are a parameter sweep, not a
     # general source refactor. Explicit policy and Gate 5 still apply.
     if tool_name == "code.copy_yaml":

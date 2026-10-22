@@ -38,7 +38,10 @@ def execution_delivery_context(*, project: str | None = None) -> dict[str, Any]:
             '命令从 MARS_JOB_REQUEST 读取本项配置和预算，产出 MARS_RESULT_PATH 与真实证据。'
             '登记命令的项目、入口和配置能力必须与本项匹配；旧命令不能作为其他模型的通用入口。'
             '声明 consumes_data_path 时必须消费 MARS 交付的数据；验证模式只检查，不训练。'
-            '若没有登记命令，明确说明执行配置未就绪，不得捏造 command_id 或声称可执行。'
+            '若没有适合的登记命令，由 Coding 在研究副本创建适配器和 YAML，然后调用 code.prepare_execution，'
+            '使用工具返回的真实 command_id；不要求用户手动登记，不把可修复的启动问题交回主控。'
+            '适配器必须处理 MARS_VALIDATE_ONLY=1 无训练预检，并遵循下面的真实请求/结果协议。'
+            '本项目选定的数据优先于仓库样例，负责适配实际数据结构；含义无法从文件或说明确定时明确提问。'
             '登记入口尚不存在时，应在允许修改范围内创建该交付文件，不将其误报为用户缺失的输入。'
             if backend == 'local_command' else
             '按当前执行适配器交付实际入口、配置、种子和预算；不能替换批准的训练条件。'
@@ -101,14 +104,15 @@ def coding_handoff_errors(plan_text: str, coding: dict[str, Any], *, project: st
                     rows = policy.get('local_commands', [])
                     ids = [str(row['id']) for row in rows if isinstance(row, dict) and row.get('id')] if isinstance(rows, list) else []
                     raise ValueError('当前执行方式 local_command 要求交付实际 command_id；可用登记 ID：'
-                                     + (', '.join(ids) if ids else '无，请先配置真实执行命令'))
-                from app.harness.tools.git_branch import current_git_branch
+                                     + (', '.join(ids) if ids else '无；由 Coding 创建适配器并调用 code.prepare_execution'))
+                from app.harness.tools.git_branch import current_git_branch, branch_owner
                 from app.harness.runtime.project_scope import current_project_scope
                 branch = current_git_branch(project)
                 scope = current_project_scope(project)
                 run_id = branch.run_id if branch is not None else scope.run_id if scope is not None else 'handoff-check'
+                owner = branch_owner(branch.root) if branch is not None else None
                 _command(LocalCommandJob(run_id=run_id, experiment_id=job['name'],
-                    project=project, run_root=scope.run_root if scope is not None else Path('.'),
+                    project=project, run_root=scope.run_root if scope is not None else owner[1] if owner else Path('.'),
                     command_id=command_id, config=config), 'execution.simulation_runner')
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(prefix + ': ' + str(exc))

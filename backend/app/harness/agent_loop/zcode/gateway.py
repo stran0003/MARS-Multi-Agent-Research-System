@@ -18,6 +18,7 @@ from app.harness.agent_loop.zcode.limits import invocation_limits
 from app.harness.llm.accounting import ResourceBudgetError, guarded_complete
 from app.harness.llm.provider_base import Completion, Delta, LLMConfig, LLMProvider, Message
 from app.harness.schema.frontmatter_parser import document_from_parts
+from app.harness.agent_loop.zcode.workspace import NATIVE_FILE_TOOLS, native_workspace, prepare_native_write, finish_native_writes
 
 WireCall = Callable[[dict[str, Any], LLMConfig], Awaitable[dict[str, Any]]]
 
@@ -78,9 +79,15 @@ def wire_tools(request: LoopInput) -> list[dict[str, Any]]:
         if spec is None or not request.registry.has(name) or spec.bridge_only:
             raise ValueError("ZCode tool is not registered: " + name)
         specs.append({"name": name, "description": spec.description, "args_schema": spec.input_schema})
-    return [{"name": item["function"]["name"], "description": item["function"]["description"],
+    result = [{"name": item["function"]["name"], "description": item["function"]["description"],
              "inputSchema": item["function"]["parameters"]}
             for item in native_specs(specs, request.final_schema)]
+    if native_workspace(request.tool_context):
+        result.append({"name": "mars_file_feedback", "description":
+            "Read MARS's actual rejection of a native file operation, then correct the path or arguments.",
+            "inputSchema": {"type": "object", "properties": {"call_id": {"type": "string"}},
+                            "required": ["call_id"], "additionalProperties": False}})
+    return result
 
 
 def protocol_tool_name(name: str) -> str:
@@ -118,6 +125,8 @@ class ZCodeGateway:
         self.tools = wire_tools(request)
         self.names = {wire_name(name): name for name in request.tools}
         self.allowed_model_tools = {protocol_tool_name(item["name"]) for item in self.tools}
+        self.native_tools = NATIVE_FILE_TOOLS if native_workspace(request.tool_context) else ()
+        self.allowed_model_tools.update(self.native_tools)
         self.done = asyncio.Event()
         self.lock = asyncio.Lock()
         self.runner: web.AppRunner | None = None
@@ -130,6 +139,52 @@ class ZCodeGateway:
 
     def save(self) -> None:
         self.trace.snapshot(self.state)
+
+    def collect_native_writes(self) -> None:
+        receipts = finish_native_writes(self.request.tool_context, self.state.setdefault('native_pending_writes', {}))
+        for receipt in receipts:
+            self.trace.emit('native_write_receipt', {'backend': 'zcode'}, visible=receipt)
+        if receipts:
+            self.save()
+
+    async def native_permission(self, params: dict[str, Any]) -> dict[str, str]:
+        name, args = params.get('toolName'), params.get('input')
+        if name in {protocol_tool_name(item['name']) for item in self.tools}:
+            return {'decision': 'allow'}  # MARS registry still owns its actual authorization.
+        try:
+            if name not in self.native_tools or not isinstance(args, dict):
+                raise ValueError('Use the project tools supplied by MARS')
+            prepare_native_write(self.request.tool_context, str(name), args,
+                                 self.state.setdefault('native_pending_writes', {}))
+            self.save()
+            return {'decision': 'allow'}
+        except (OSError, ValueError) as exc:
+            return {'decision': 'deny', 'reason': str(exc)}
+
+    def prepare_native_calls(self, response: dict[str, Any]) -> None:
+        """Return scope/argument errors to the coding loop, never as model failures.
+
+        Preserve the upstream call in the trace. A rejected operation is replaced
+        by a host feedback tool; ZCode must not execute the rejected native call.
+        """
+        for choice in response['choices']:
+            for call in choice.get('message', {}).get('tool_calls') or []:
+                function = call.get('function', {})
+                if function.get('name') not in self.native_tools:
+                    continue
+                try:
+                    args = json.loads(function.get('arguments', '{}'))
+                    if not isinstance(args, dict):
+                        raise ValueError('File tool arguments must be an object')
+                    prepare_native_write(self.request.tool_context, function['name'], args,
+                                         self.state.setdefault('native_pending_writes', {}))
+                except (OSError, ValueError, TypeError) as exc:
+                    rejection = {'tool': function['name'], 'error': str(exc)[:1500],
+                                 'executed': False, 'call_id': call['id']}
+                    self.state.setdefault('native_rejections', {})[call['id']] = rejection
+                    self.trace.emit('native_tool_rejected', rejection, visible=function)
+                    call['function'] = {'name': protocol_tool_name('mars_file_feedback'),
+                                        'arguments': canonical({'call_id': call['id']})}
 
     def stop(self, status: str, error: str) -> None:
         self.state.update(status=status, error=error)
@@ -181,6 +236,7 @@ class ZCodeGateway:
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise web.HTTPBadRequest(text="Invalid model request")
         async with self.lock:
+            self.collect_native_writes()
             counts = self.state["counts"]
             if self.state["status"] != "running":
                 raise web.HTTPConflict(text="MARS invocation stopped")
@@ -224,6 +280,7 @@ class ZCodeGateway:
                             "tool_calls": c.get("message", {}).get("tool_calls")}
                            for c in result["choices"]]
                 self.trace.emit("model_response", {"model": response.model, "usage": usage}, visible=visible)
+                self.prepare_native_calls(result)
                 self.save()
                 if payload.get("stream"):
                     return web.Response(text=stream_envelope(result), content_type="text/event-stream")
@@ -274,7 +331,11 @@ class ZCodeGateway:
     async def call_tool(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         if self.state["status"] != "running":
             return mcp_result({"error": "MARS invocation stopped"}, error=True)
+        if name == 'mars_file_feedback':
+            rejection = self.state.get('native_rejections', {}).get(args.get('call_id'))
+            return mcp_result(rejection or {'error': 'Unknown file operation'}, error=True)
         if name == "mars_submit_document" and self.request.final_schema:
+            self.collect_native_writes()
             try:
                 if {"tool", "args", "observations", "actions", "approved", "approval", "decision_rule"}.intersection(args):
                     raise ValueError("Document submission cannot contain tool actions or observations")

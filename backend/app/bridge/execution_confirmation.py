@@ -103,6 +103,9 @@ def execution_preview(run: RunHandle, node_key: str) -> dict[str, Any]:
     from app.bridge.agent_runner import _load_selected_data_source
     settings = get_settings()
     config = load_execution_config()['execution']
+    from app.harness.tools.execution.prepared_command import prepared_commands
+    config['local_commands'] = [*config.get('local_commands', []),
+                                *prepared_commands(run.root, run.project, run.run_id)]
     configured = str(config['backend'])
     blockers: list[str] = []
     warnings: list[str] = []

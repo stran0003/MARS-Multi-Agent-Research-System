@@ -144,6 +144,7 @@ class Commander:
             completion_reviews: dict[str, Any] = {}
             last_completion: CompletionVerdict | None = None
             pending_correction: dict[str, Any] | None = None
+            steps_exhausted = False
 
             for _step in range(self.max_react_steps):
                 terminal_receipt = False
@@ -448,9 +449,14 @@ class Commander:
                             content=_completion_unfinished_reply(last_completion))))
                     break
                 # loop again so the LLM can react to tool results
-            if emitted and emitted[-1].role == "tool":
+            else:
+                steps_exhausted = True
+            if steps_exhausted or (emitted and emitted[-1].role == "tool"):
                 goal, last_completion, question = await self._completion_gate(
                     session, goal, "", completion_reviews)
+                if steps_exhausted and last_completion.status in {"pending", "unknown"}:
+                    last_completion = replace(last_completion,
+                        reason=f"commander_step_limit:{self.max_react_steps}")
                 if last_completion.status not in {"fulfilled", "delegated"}:
                     emitted.append(session.add(ChatMessage(role="assistant",
                         content=question if last_completion.status == "needs_user" and question
@@ -702,10 +708,8 @@ class Commander:
             elif m.role == "assistant":
                 msgs.append(Message(role="assistant", content=m.content))
             elif m.role == "tool":
-                obs = json.dumps(m.tool_result, ensure_ascii=False)
-                msgs.append(
-                    Message(role="user", content=f"[observation tool={m.tool_name}] {obs}")
-                )
+                from app.bridge.commander_context import observation_message
+                msgs.append(observation_message(m))
         msgs.append(
             Message(
                 role="user",
@@ -861,6 +865,11 @@ def _completion_unfinished_reply(verdict: CompletionVerdict) -> str:
         'artifact_updated': '文件修改结果', 'exported': '导出文件', 'observed': '实际查阅结果',
         'tool_effect': '操作结果', 'semantic_answer': '完整答复', 'declared_effect': '实际操作结果'}
     missing = '、'.join(labels.get(item, item) for item in verdict.missing)
+    if verdict.reason.startswith('commander_step_limit:'):
+        steps = verdict.reason.partition(':')[2]
+        return (f'主控达到本轮 {steps} 步处理上限，操作尚未完成。'
+                + ('尚未取得的完成依据：' + missing + '。' if missing else '')
+                + '请求、读取结果和已有任务均已保留；可点击“继续处理”接着处理。')
     return ('本轮操作尚未完成，已保留请求与实际进度。'
             + ('尚未取得的完成依据：' + missing + '。' if missing else '本轮全部要求尚未核对完成。'))
 

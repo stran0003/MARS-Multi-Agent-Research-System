@@ -209,7 +209,7 @@ def observation_only_messages(messages: list[Message], *, add_instruction: bool 
 def pack_native_commander_messages(session: CommanderSession, messages: list[Message],
                                    config: LLMConfig, root: Path) -> tuple[list[Message], Path | None]:
     """Pack and persist the actual native wire payload under the existing policy."""
-    from app.bridge.commander_context import commander_materials
+    from app.bridge.commander_context import commander_materials, pending_observation_keys
     from app.harness.agent_loop.trace import atomic_json
     from app.harness.context.runtime_manifest import record_manifest
     from app.harness.context.runtime_pack import message_key, pack_messages
@@ -219,7 +219,7 @@ def pack_native_commander_messages(session: CommanderSession, messages: list[Mes
     if session.context_version < 3:
         return wire, None
     materials = commander_materials(wire)
-    original_materials = commander_materials(messages)
+    original_materials = commander_materials(messages, pending=pending_observation_keys(session))
     for original, converted in zip(messages, wire):
         material = original_materials.get(message_key(original))
         if material is not None:
@@ -235,11 +235,17 @@ def pack_native_commander_messages(session: CommanderSession, messages: list[Mes
         if type(working) is not int or working <= 0:
             raise ValueError('Commander working context must be a positive integer')
         budget = min(budget, working)
+    # Old 24K packing offloaded observations before the first model read. Do
+    # not perpetuate those stale decisions after a policy/budget change. The
+    # original messages/materials remain intact and are repacked normally.
+    if previous.get('commander_packing_version') != 2 or previous.get('budget') != budget:
+        previous = {}
     wire, manifest = pack_messages(wire, policy=policy,
         budget=budget,
         tools=config.tools, materials=materials, root=root, previous=previous, agent='commander')
     # Packing must not reintroduce provider-incompatible assistant/tool history.
     wire = observation_only_messages(wire, add_instruction=False)
+    manifest['state'].update(commander_packing_version=2, budget=budget)
     session.context_compaction = manifest['state']
     atomic_json(state_path, session.context_compaction)
     path = record_manifest(root, agent='commander', node=session.conv_id, project=session.project,

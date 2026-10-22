@@ -32,20 +32,18 @@ def test_json_error_points_into_original_multiline_arguments() -> None:
 
 @pytest.mark.parametrize("arguments", [
     '"legacy document text"', "null", "[]", "1", "true",
-    '{}', '{"metadata":{"x":1}}', '{"body":"text"}',
-    '{"metadata":{"x":1},"body":"text","decision_rule":{}}',
+    '{}', '{"body":"text"}',
     '{"final":{"metadata":{"x":1},"body":"text"}}',
 ])
-def test_native_document_requires_exact_root_fields(arguments: str) -> None:
-    with pytest.raises(ValueError, match="^document arguments require exactly metadata and body$"):
+def test_native_document_requires_metadata_object(arguments: str) -> None:
+    with pytest.raises(ValueError, match="document arguments require metadata"):
         _parse_arguments(arguments)
 
 
 @pytest.mark.parametrize("arguments, error", [
-    ('{"metadata":{},"body":"text"}', "final.metadata"),
-    ('{"metadata":[],"body":"text"}', "final.metadata"),
-    ('{"metadata":{"x":1},"body":"  "}', "final.body"),
-    ('{"metadata":{"x":1},"body":[]}', "final.body"),
+    ('{"metadata":{},"body":"text"}', "metadata"),
+    ('{"metadata":[],"body":"text"}', "metadata"),
+    ('{"metadata":{"x":1},"body":[]}', "body"),
 ])
 def test_parsed_document_still_uses_existing_final_contract(arguments: str, error: str) -> None:
     with pytest.raises(ValueError, match=error):

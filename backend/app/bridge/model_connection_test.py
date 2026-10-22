@@ -13,7 +13,7 @@ from app.harness.llm.model_capabilities import setup_reasoning
 from app.harness.llm.model_registry import (
     AgentConfig, _models_config, _provider_credentials, configured_runtime_options, get_agent_config,
 )
-from app.harness.llm.provider_base import LLMConfig, LLMProvider, Message
+from app.harness.llm.provider_base import LLMConfig, LLMProvider, Message, model_request_timeout
 from app.harness.llm.openai_provider import _OpenAICompatProvider, public_error_details
 from app.settings import env_or_local, repo_root
 
@@ -46,7 +46,8 @@ class ProbePolicy(BaseModel):
 
 def probe_policy() -> ProbePolicy:
     raw = yaml.safe_load((repo_root() / "configs/models.yaml").read_text(encoding="utf-8"))
-    return ProbePolicy.model_validate(raw["connection_test"])
+    policy = ProbePolicy.model_validate(raw["connection_test"])
+    return policy.model_copy(update={"timeout_seconds": model_request_timeout(policy.timeout_seconds)})
 
 
 def matching_probe_runtime(request: ConnectionTestRequest, selected: AgentConfig, endpoint: str) -> dict[str, object]:

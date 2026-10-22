@@ -7,6 +7,8 @@ before launching a trusted adapter.
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -163,7 +165,7 @@ def build_code_workspace_transfer(
         if archive_size > max_bytes:
             raise CodeWorkspaceTransferError("workspace archive exceeds max_bytes")
         archive_hash = _sha256_file(temporary_archive)
-        os.replace(temporary_archive, archive_path)
+        replace_complete_file(temporary_archive, archive_path)
     finally:
         temporary_archive.unlink(missing_ok=True)
 
@@ -194,7 +196,7 @@ def build_code_workspace_transfer(
     try:
         temporary_receipt.write_bytes(receipt_bytes)
         temporary_receipt.chmod(0o644)
-        os.replace(temporary_receipt, receipt_path)
+        replace_complete_file(temporary_receipt, receipt_path)
     finally:
         temporary_receipt.unlink(missing_ok=True)
     package = CodeWorkspaceTransferPackage(
@@ -295,7 +297,7 @@ def verify_and_extract_code_workspace_transfer(
         if verified.manifest_sha256 != receipt.workspace_manifest_sha256:
             raise CodeWorkspaceTransferError("workspace manifest hash mismatch")
         try:
-            os.replace(workspace_root, normalized_destination)
+            replace_complete_file(workspace_root, normalized_destination)
         except OSError as exc:
             raise CodeWorkspaceTransferError(
                 f"cannot publish verified workspace: {exc}"

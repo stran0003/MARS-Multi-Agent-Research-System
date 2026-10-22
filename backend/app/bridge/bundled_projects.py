@@ -1,6 +1,8 @@
 """Restore explicitly bundled project history without invoking any agent."""
 from __future__ import annotations
 
+from app.harness.persistence import rename_path
+
 import hashlib
 import json
 import os
@@ -77,7 +79,7 @@ def restore_bundled_project(root: Path, entry: dict[str, Any], *, registry: Path
             import yaml
             if yaml.safe_load(marker.read_text(encoding="utf-8")).get("name") != identity:
                 raise ValueError("Bundled project identity mismatch")
-            (temporary / name).rename(destination)
+            rename_path(temporary / name, destination)
         finally:
             shutil.rmtree(_native_path(temporary), ignore_errors=True)
     import yaml

@@ -161,8 +161,10 @@ async def test_real_approval_preview_and_confirmation_share_delivered_jobs(
         assert receipt['created'] and not save_confirmation(session.run, 'execution', view['token'])['created']
         store.approve(store.write(text=dumps(metadata, 'Updated coding delivery requires fresh execution intake.')))
         after = execution_preview(session.run, 'execution')
-        assert after['token'] != view['token'] and not after['confirmed'] and after['blockers']
-        assert any('coding_spec_sha256' in error for error in after['blockers'])
+        assert after['token'] != view['token'] and not after['confirmed']
+        # A changed document invalidates the old confirmation, but identical
+        # executable parameters can be confirmed without regenerating artifacts.
+        assert not after['blockers']
         assert not (session.run.root / 'execution/jobs').exists()
         assert not (session.run.root / 'experiment/experiment_plan.approved.md').exists()
     finally:

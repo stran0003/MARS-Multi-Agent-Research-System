@@ -2,7 +2,7 @@
 export const CLIENT_POLICY = {
   requestTimeoutMs: Number(process.env.NEXT_PUBLIC_MARS_REQUEST_TIMEOUT_MS),
   executionConfirmationTimeoutMs: Number(process.env.NEXT_PUBLIC_MARS_EXECUTION_CONFIRMATION_TIMEOUT_MS),
-  connectionTestTimeoutMs: Number(process.env.NEXT_PUBLIC_MARS_CONNECTION_TEST_TIMEOUT_MS),
+  connectionTestTimeoutMs: Math.max(750000, Number(process.env.NEXT_PUBLIC_MARS_CONNECTION_TEST_TIMEOUT_MS) || 750000),
   controlRefreshMs: Number(process.env.NEXT_PUBLIC_MARS_CONTROL_REFRESH_MS),
   activityClockMs: Number(process.env.NEXT_PUBLIC_MARS_ACTIVITY_CLOCK_MS),
   readinessRefreshMs: Number(process.env.NEXT_PUBLIC_MARS_READINESS_REFRESH_MS),

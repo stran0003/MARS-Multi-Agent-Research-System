@@ -1,6 +1,8 @@
 """Durable job receipts; completed work is reused only with intact real evidence."""
 from __future__ import annotations
 
+from app.harness.persistence import atomic_write_json, path_lock, replace_complete_file
+
 import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -14,8 +16,6 @@ from typing import Any
 from app.execution.results import SimulationResult
 from app.execution.simulation_runner import JobSpec, run_one
 from app.harness.agent_loop.trace import digest
-from app.harness.persistence import atomic_write_json
-from app.harness.persistence import path_lock
 from app.settings import get_settings
 
 
@@ -186,8 +186,8 @@ def rearm_interrupted_jobs(specs: list[JobSpec], *, steps: int) -> None:
             archive.mkdir(parents=True, exist_ok=False)
             claim = path.with_suffix('.claim')
             if claim.exists():
-                claim.replace(archive / claim.name)
-            path.replace(archive / path.name)
+                replace_complete_file(claim, archive / claim.name)
+            replace_complete_file(path, archive / path.name)
 
 
 def stopped_execution_retry_blocker(run_root: Path) -> str:

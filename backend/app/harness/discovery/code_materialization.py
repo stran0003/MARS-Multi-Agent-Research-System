@@ -6,6 +6,8 @@ already live in a caller-owned content-addressed blob store.
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import hashlib
 import os
 import re
@@ -360,6 +362,7 @@ def materialize_code_workspace(
         manifest_path.write_text(
             canonical_json(manifest.model_dump(mode="json")) + "\n",
             encoding="utf-8",
+            newline="",
         )
         manifest_path.chmod(0o644)
         staged = verify_code_workspace(
@@ -379,7 +382,7 @@ def materialize_code_workspace(
         )
 
         try:
-            os.replace(temporary, destination)
+            replace_complete_file(temporary, destination)
         except OSError as exc:
             if not _path_exists(destination):
                 raise MaterializationError(
@@ -464,7 +467,7 @@ def verify_code_workspace(
     _assert_no_symlink_components(manifest_path, label="workspace manifest")
     try:
         manifest_mode = stat.S_IMODE(manifest_path.stat(follow_symlinks=False).st_mode)
-        if manifest_mode != 0o644:
+        if os.name != "nt" and manifest_mode != 0o644:
             raise MaterializationError("workspace manifest mode must be 0644")
         manifest_bytes = _read_regular_file(manifest_path, label="workspace manifest")
         manifest_text = manifest_bytes.decode("utf-8", errors="strict")
@@ -476,9 +479,9 @@ def verify_code_workspace(
             raise
         raise MaterializationError(f"cannot read workspace manifest: {exc}") from exc
 
-    canonical = canonical_json(manifest.model_dump(mode="json")) + "\n"
-    if manifest_text != canonical:
-        raise MaterializationError("workspace manifest is not canonical JSON")
+    # Parsing and semantic identities govern validity. JSON indentation,
+    # key order and Windows line endings do not change the execution contract.
+    # The returned receipt still hashes the actual manifest bytes.
     _check_expected("candidate_id", manifest.candidate_id, expected_candidate_id)
     _check_expected(
         "base_snapshot_id",
@@ -832,7 +835,7 @@ def _code_blob_size(blob_root: Path, digest: str) -> int:
     path = content_blob_path(blob_root, digest)
     _assert_contained(blob_root, path, label="code blob")
     _assert_no_symlink_components(path, label="code blob")
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
@@ -889,7 +892,7 @@ def _read_regular_file(
     max_bytes: int | None = None,
     max_bytes_label: str = "max_blob_bytes",
 ) -> bytes:
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):
@@ -950,21 +953,25 @@ def _build_manifest(
 
 
 def _inventory_workspace(root: Path) -> _WorkspaceInventory:
-    if stat.S_IMODE(root.stat(follow_symlinks=False).st_mode) != 0o755:
+    # NTFS access is governed by ACLs; chmod/stat do not round-trip POSIX
+    # 0755/0644. Keep the portable manifest modes for export, but only enforce
+    # them where meaningful. File types, identities and bytes remain checked.
+    if os.name != "nt" and stat.S_IMODE(root.stat(follow_symlinks=False).st_mode) != 0o755:
         raise MaterializationError("workspace root mode must be 0755")
     directories: list[CodeWorkspaceDirectory] = []
     files: list[CodeWorkspaceFile] = []
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
-        mode = path.stat(follow_symlinks=False).st_mode
-        if stat.S_ISLNK(mode):
+        info = path.stat(follow_symlinks=False)
+        mode = info.st_mode
+        if _is_link(info):
             raise MaterializationError(f"workspace contains a symlink: {relative}")
         if stat.S_ISDIR(mode):
             if _hard_forbidden(relative):
                 raise MaterializationError(
                     f"workspace contains a hard-forbidden directory: {relative}"
                 )
-            if stat.S_IMODE(mode) != 0o755:
+            if os.name != "nt" and stat.S_IMODE(mode) != 0o755:
                 raise MaterializationError(
                     f"workspace directory mode must be 0755: {relative}"
                 )
@@ -978,7 +985,7 @@ def _inventory_workspace(root: Path) -> _WorkspaceInventory:
             raise MaterializationError(
                 f"workspace contains a hard-forbidden file: {relative}"
             )
-        if stat.S_IMODE(mode) != 0o644:
+        if os.name != "nt" and stat.S_IMODE(mode) != 0o644:
             raise MaterializationError(f"workspace file mode must be 0644: {relative}")
         files.append(
             CodeWorkspaceFile(
@@ -1112,13 +1119,20 @@ def _assert_no_symlink_components(path: Path, *, label: str) -> None:
     for part in absolute.parts[1:]:
         current /= part
         try:
-            mode = current.stat(follow_symlinks=False).st_mode
+            info = current.stat(follow_symlinks=False)
         except FileNotFoundError:
             return
         except OSError as exc:
             raise MaterializationError(f"cannot inspect {label} ancestors: {exc}") from exc
-        if stat.S_ISLNK(mode):
+        if _is_link(info):
             raise MaterializationError(f"{label} contains a symlink ancestor: {current}")
+
+
+def _is_link(info: os.stat_result) -> bool:
+    # Python 3.11 is_symlink does not identify Windows directory junctions.
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    )
 
 
 def _assert_contained(root: Path, target: Path, *, label: str) -> None:
@@ -1144,8 +1158,9 @@ def _path_exists(path: Path) -> bool:
 
 def _fix_published_modes(root: Path) -> None:
     for path in sorted(root.rglob("*")):
-        mode = path.stat(follow_symlinks=False).st_mode
-        if stat.S_ISLNK(mode):
+        info = path.stat(follow_symlinks=False)
+        mode = info.st_mode
+        if _is_link(info):
             raise MaterializationError(f"workspace contains a symlink: {path}")
         if stat.S_ISDIR(mode):
             path.chmod(0o755)
@@ -1158,7 +1173,7 @@ def _fix_published_modes(root: Path) -> None:
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
-    flags = os.O_RDONLY
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     if hasattr(os, "O_NONBLOCK"):

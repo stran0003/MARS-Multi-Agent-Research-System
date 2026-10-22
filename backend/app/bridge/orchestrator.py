@@ -2403,12 +2403,8 @@ class Orchestrator:
             "extra": dict(extra),
         }
         target = run.subdir("input") / "run_request_options.v1.json"
-        temporary = target.with_suffix(target.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        temporary.replace(target)
+        from app.harness.persistence import atomic_write_json
+        atomic_write_json(target, payload)
 
     # ----------------------------------------------------- state + emission
 

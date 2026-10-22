@@ -15,7 +15,7 @@ from typing import Any, TypeVar
 
 from loguru import logger
 
-from app.harness.llm.model_capabilities import ModelCompatibilityError, requires_glm_thinking, supports_glm_observation_tools
+from app.harness.llm.model_capabilities import ModelCompatibilityError, requires_glm_thinking
 from app.harness.llm.request_evidence import record_provider_request
 from app.harness.llm.provider_base import (
     Completion,
@@ -102,7 +102,7 @@ def _public_final_text(text: str) -> str:
     return remaining
 
 
-def _decode_gateway_body(body: str | bytes) -> tuple[Any, bool]:
+def _decode_gateway_body(body: str | bytes) -> tuple[Any, bool, bool]:
     """Decode a completed HTTP body when a gateway ignores the requested format.
 
     SSE event data may span lines; comments, heartbeat events and [DONE] are
@@ -111,7 +111,7 @@ def _decode_gateway_body(body: str | bytes) -> tuple[Any, bool]:
     """
     text = body.decode("utf-8-sig") if isinstance(body, bytes) else body.lstrip("\ufeff")
     try:
-        return json.loads(text), False
+        return json.loads(text), False, False
     except json.JSONDecodeError:
         pass
     events: list[Any] = []
@@ -149,7 +149,7 @@ def _decode_gateway_body(body: str | bytes) -> tuple[Any, bool]:
     flush()
     if not events:
         raise ValueError("Empty upstream SSE body")
-    return events, True
+    return events, True, done
 
 
 @dataclass
@@ -164,6 +164,11 @@ class VisibleStreamAccumulator:
     visible_chars: int = 0
     identity: ResponseModelIdentity = field(default_factory=ResponseModelIdentity)
     tool_fragments: dict[int, dict[str, str]] = field(default_factory=dict)
+    end_marker: bool = False
+    # Only the private ZCode wire bridge needs these for a provider's next
+    # thinking/tool turn. Never include them in Completion or public traces.
+    preserve_reasoning: bool = False
+    reasoning: dict[str, str] = field(default_factory=dict, repr=False)
 
     def add(self, chunk: Any) -> None:
         chunk = _unwrap_completion(chunk)
@@ -182,9 +187,15 @@ class VisibleStreamAccumulator:
             if (_envelope_field(choice, "index") or 0) != 0:
                 continue
             delta = _envelope_field(choice, "delta")
+            full_message = delta is None
             # Some gateways wrap a complete message in a single SSE event.
             if delta is None:
                 delta = _envelope_field(choice, "message")
+            if self.preserve_reasoning:
+                for key in ("reasoning", "reasoning_content"):
+                    value = _envelope_field(delta, key)
+                    if isinstance(value, str):
+                        self.reasoning[key] = self.reasoning.get(key, "") + value
             piece = _public_content(_envelope_field(delta, "content"))
             if piece:
                 self.pieces.append(piece)
@@ -193,10 +204,10 @@ class VisibleStreamAccumulator:
             legacy = _envelope_field(delta, "function_call")
             if legacy and not calls:
                 calls = ({"index": 0, "function": legacy},)
-            for call in calls:
+            for ordinal, call in enumerate(calls):
                 index = _envelope_field(call, "index")
-                if index is None and len(calls) == 1:
-                    index = 0
+                if index is None and (full_message or len(calls) == 1):
+                    index = ordinal
                 if not isinstance(index, int) or index < 0:
                     raise ValueError("Invalid upstream tool call index")
                 parts = self.tool_fragments.setdefault(index, {"id": "", "name": "", "arguments": ""})
@@ -214,7 +225,10 @@ class VisibleStreamAccumulator:
                         value = json.dumps(value, ensure_ascii=False, allow_nan=False)
                     if not isinstance(value, str):
                         raise ValueError("Invalid upstream tool call fragment")
-                    parts[key] += value
+                    # A few gateways repeat the complete function name in each
+                    # delta; argument fragments must always remain byte-exact.
+                    if key != "name" or value != parts[key]:
+                        parts[key] += value
             reason = _envelope_field(choice, "finish_reason")
             if reason is not None:
                 self.finish_reason = str(reason)
@@ -224,7 +238,8 @@ class VisibleStreamAccumulator:
         self.pieces = [text] if text else []
         self.visible_chars = len(text)
         code = ("output_truncated" if self.finish_reason == "length" else
-                "incomplete_stream" if self.finish_reason not in {"stop", "tool_calls", "function_call"} else
+                "incomplete_stream" if (self.finish_reason not in {"stop", "tool_calls", "function_call"}
+                                        and not (self.end_marker and self.finish_reason is None)) else
                 "empty_final_content" if not text.strip() and not self.tool_fragments else "")
         if code:
             raise LLMCompletionError(code=code, provider=provider, model=model,
@@ -233,11 +248,11 @@ class VisibleStreamAccumulator:
         if self.tool_fragments and not allow_tools:
             raise ValueError("unsolicited tool calls without configured tools")
         calls = []
-        for _, parts in sorted(self.tool_fragments.items()):
+        for index, parts in sorted(self.tool_fragments.items()):
             if not parts["name"] or not parts["arguments"]:
                 raise ValueError("Incomplete upstream streamed tool call")
             call_id = parts["id"] or "compat_" + hashlib.sha256(
-                (parts["name"] + parts["arguments"]).encode()).hexdigest()[:24]
+                (str(index) + parts["name"] + parts["arguments"]).encode()).hexdigest()[:24]
             calls.append(ToolCall(id=call_id, name=parts["name"], arguments=parts["arguments"]))
         return Completion(text=text, tool_calls=tuple(calls), provider=provider, model=self.identity.model,
                           raw={"usage": self.usage, "finish_reason": self.finish_reason,
@@ -312,6 +327,7 @@ class _OpenAICompatProvider(LLMProvider):
                 raise ModelCompatibilityError("GLM-5.3 requires thinking enabled; use reasoning_effort=low")
             thinking_enabled = True
         kwargs: dict[str, Any] = {
+            "stream": stream,
             "model": config.model,
             "max_tokens": config.max_tokens,
             "messages": [
@@ -329,10 +345,9 @@ class _OpenAICompatProvider(LLMProvider):
                 # Never replay incomplete assistant/tool turns without the private
                 # reasoning history. GLM and DeepSeek use the same explicit
                 # observation-only contract; no hidden reasoning is replayed.
-                if ((self.name != "deepseek" and not supports_glm_observation_tools(self.name, config.model))
-                        or config.extra.get("native_observation_history") is not True
+                if (config.extra.get("native_observation_history") is not True
                         or any(m.role in {"assistant", "tool"} or m.tool_calls for m in messages)):
-                    raise ModelCompatibilityError("native thinking tools require supported observation-only history")
+                    raise ModelCompatibilityError("native thinking tools require observation-only history")
             kwargs["tools"] = list(config.tools)
             kwargs["parallel_tool_calls"] = False
             if self.name == "deepseek" and config.thinking_enabled is False and len(config.tools) == 1:
@@ -398,6 +413,7 @@ class _OpenAICompatProvider(LLMProvider):
             for optional in ("extra_body", "reasoning_effort", "response_format", "parallel_tool_calls", "top_p"):
                 kwargs.pop(optional, None)
         if (config.extra.get("template_family") == "qwen38_instruct"
+                and config.extra.get("gateway_plain_request") is not True
                 and config.extra.get("gateway_omit_template_options") is not True):
             # Explicit operator-selected deployment profile, never a guessed
             # model alias. Official Qwen3.8 non-thinking wire parameters.
@@ -472,10 +488,12 @@ class _OpenAICompatProvider(LLMProvider):
         request_kwargs = self._request_kwargs(messages, config)
         record_provider_request(config, self.name, request_kwargs)
         resp = await self._request_with_retries(
-            lambda: client.chat.completions.create(**request_kwargs),
+            lambda: client.chat.completions.with_raw_response.create(**request_kwargs),
             config=config,
         )
-        return self._completion_from_response(resp, config)
+        # The SDK otherwise parses according to Content-Type before we can
+        # handle a gateway that labels SSE as JSON (or returns raw SSE text).
+        return self._completion_from_response(resp.http_response.content, config)
 
     async def _complete_streaming(self, messages: list[Message], config: LLMConfig) -> Completion:
         """One complete result from real SSE, for any configured compatible ID.
@@ -512,48 +530,59 @@ class _OpenAICompatProvider(LLMProvider):
         SDK retries remain disabled; attempts use the same accounting observer.
         Credentials never leave this selected provider.
         """
-        from openai.types.chat import ChatCompletion
-
+        payload = {**payload, "stream": False}
+        payload.pop("stream_options", None)
         client = self._get_client()
         record_provider_request(config, self.name, payload)
+        # Use the SDK's public raw-response API, preserving arbitrary owned
+        # ZCode extensions through extra_body rather than private SDK hooks.
+        options = {key: value for key, value in payload.items() if key not in {"model", "messages", "stream"}}
         response = await self._request_with_retries(
-            lambda: client.post("/chat/completions", body=payload, cast_to=ChatCompletion,
-                                options={"timeout": config.request_timeout_seconds}), config=config)
-        return self._wire_from_response(response, payload, config)
+            lambda: client.chat.completions.with_raw_response.create(
+                model=payload["model"], messages=payload["messages"], stream=False,
+                extra_body=options, timeout=config.request_timeout_seconds), config=config)
+        return self._wire_from_response(response.http_response.content, payload, config)
 
     def _wire_from_response(self, response: Any, payload: dict[str, Any], config: LLMConfig) -> dict[str, Any]:
         if isinstance(response, (str, bytes)):
-            decoded, is_sse = _decode_gateway_body(response)
+            decoded, is_sse, done = _decode_gateway_body(response)
             if is_sse:
-                state = VisibleStreamAccumulator()
+                state = VisibleStreamAccumulator(end_marker=done, preserve_reasoning=True)
                 for chunk in decoded:
                     state.add(chunk)
                 result_config = replace(config, tools=tuple(payload.get("tools") or ()))
                 completion = state.completion(provider=self.name, model=result_config.model,
                                               allow_tools=bool(result_config.tools))
                 message: dict[str, Any] = {"role": "assistant", "content": completion.text or None}
+                message.update(state.reasoning)
                 if completion.tool_calls:
                     message["tool_calls"] = [call.to_wire() for call in completion.tool_calls]
                 return {"object": "chat.completion", "model": completion.model,
-                        "choices": [{"index": 0, "message": message, "finish_reason": state.finish_reason}],
+                        "choices": [{"index": 0, "message": message, "finish_reason": state.finish_reason or
+                                     ("tool_calls" if completion.tool_calls else "stop")}],
                         "usage": state.usage}
             response = decoded
         result = (_unwrap_completion(response) if isinstance(response, Mapping)
-                  else response.model_dump(exclude_none=True))
+                  else response.model_dump(exclude_none=True) if hasattr(response, "model_dump") else None)
         if not isinstance(result, dict):
             raise ValueError("Invalid upstream completion envelope")
+        # Validate both transports identically; reasoning-only replies and
+        # truncated tool arguments cannot become successful ZCode deliveries.
+        self._completion_from_response(result, replace(config, tools=tuple(payload.get("tools") or ())))
         return result
 
     def _completion_from_response(self, resp: Any, config: LLMConfig) -> Completion:
         """Pure SDK-envelope parsing; it performs no model/service execution."""
         if isinstance(resp, (str, bytes)):
-            resp, is_sse = _decode_gateway_body(resp)
+            resp, is_sse, done = _decode_gateway_body(resp)
             if is_sse:
-                state = VisibleStreamAccumulator()
+                state = VisibleStreamAccumulator(end_marker=done)
                 for chunk in resp:
                     state.add(chunk)
                 return state.completion(provider=self.name, model=config.model, allow_tools=bool(config.tools))
         resp = _unwrap_completion(resp)
+        if _envelope_field(resp, "error"):
+            raise ValueError("Upstream returned a model error envelope")
         identity = ResponseModelIdentity()
         identity.add(_envelope_field(resp, "model"))
         choices = _envelope_field(resp, "choices")
@@ -562,9 +591,11 @@ class _OpenAICompatProvider(LLMProvider):
                                      finish_reason=None, empty_final=True,
                                      usage=_usage_payload(_envelope_field(resp, "usage")),
                                      model_identity=identity.metadata(config.model))
+        if not isinstance(choices, (list, tuple)):
+            raise ValueError("Invalid upstream choices: expected a list")
         response_choice = choices[0]
         message = _envelope_field(response_choice, "message")
-        # Never surface or persist reasoning_content. It may contain hidden
+        # Never surface or persist reasoning/reasoning_content. They may contain hidden
         # chain-of-thought and is not the provider's final answer.
         content = _envelope_field(message, "content") if message is not None else _envelope_field(response_choice, "text")
         text = _public_final_text(_public_content(content))
@@ -576,17 +607,19 @@ class _OpenAICompatProvider(LLMProvider):
         legacy = _envelope_field(message, "function_call")
         if not raw_calls and legacy:
             raw_calls = ({"function": legacy},)
-        for call in raw_calls:
-            function = call.get("function", {}) if isinstance(call, dict) else call.function
-            name = function.get("name") if isinstance(function, dict) else getattr(function, "name", None)
-            arguments = function.get("arguments", {}) if isinstance(function, dict) else getattr(function, "arguments", "{}")
+        if not isinstance(raw_calls, (list, tuple)):
+            raise ValueError("Invalid upstream tool_calls: expected a list")
+        for index, call in enumerate(raw_calls):
+            function = _envelope_field(call, "function")
+            name = _envelope_field(function, "name")
+            arguments = _envelope_field(function, "arguments")
             if isinstance(arguments, dict):
                 arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
             if not isinstance(name, str) or not name or not isinstance(arguments, str):
                 raise ValueError("Invalid upstream completion envelope")
             call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
             if not call_id:
-                call_id = "compat_" + hashlib.sha256((name + arguments).encode()).hexdigest()[:24]
+                call_id = "compat_" + hashlib.sha256((str(index) + name + arguments).encode()).hexdigest()[:24]
             calls_list.append(ToolCall(id=call_id, name=name, arguments=arguments))
         calls = tuple(calls_list)
         if calls and not config.tools:
@@ -621,10 +654,12 @@ class _OpenAICompatProvider(LLMProvider):
 
     @staticmethod
     def _visible_stream_delta(chunk: Any) -> tuple[str, str | None]:
-        if not chunk.choices:
+        choices = _envelope_field(_unwrap_completion(chunk), "choices")
+        if not choices:
             return "", None
-        choice = chunk.choices[0]
-        return str(choice.delta.content or ""), _optional_string(getattr(choice, "finish_reason", None))
+        choice = choices[0]
+        delta = _envelope_field(choice, "delta") or _envelope_field(choice, "message")
+        return _public_content(_envelope_field(delta, "content")), _optional_string(_envelope_field(choice, "finish_reason"))
 
     async def stream(
         self, messages: list[Message], config: LLMConfig
@@ -636,15 +671,21 @@ class _OpenAICompatProvider(LLMProvider):
             lambda: client.chat.completions.create(**request_kwargs),
             config=config,
         )
+        if isinstance(stream, (str, bytes, Mapping)) or _envelope_field(stream, "choices") is not None:
+            completion = self._completion_from_response(stream, config)
+            yield Delta(text=completion.text, finish_reason=completion.raw.get("finish_reason") or "stop",
+                        usage=completion.raw.get("usage"))
+            return
         finish_reason: str | None = None
         visible_content_seen = False
-        async for chunk in stream:
-            piece, chunk_finish_reason = self._visible_stream_delta(chunk)
-            if chunk_finish_reason is not None:
-                finish_reason = chunk_finish_reason
-            if piece:
-                visible_content_seen = visible_content_seen or bool(piece.strip())
-                yield Delta(text=piece)
+        async with stream:
+            async for chunk in stream:
+                piece, chunk_finish_reason = self._visible_stream_delta(chunk)
+                if chunk_finish_reason is not None:
+                    finish_reason = chunk_finish_reason
+                if piece:
+                    visible_content_seen = visible_content_seen or bool(piece.strip())
+                    yield Delta(text=piece)
         self._check_final(config, finish_reason, visible_content_seen)
         yield Delta(text="", finish_reason=finish_reason or "stop")
 

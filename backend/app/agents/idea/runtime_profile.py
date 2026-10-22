@@ -21,6 +21,8 @@ import yaml
 from app.harness.agent_loop import AgentLoopPolicy
 from app.harness.agent_loop.trace import canonical, digest
 from app.harness.llm.model_registry import AgentConfig, get_agent_config
+from app.harness.llm.provider_base import model_request_timeout
+from app.harness.persistence import atomic_write_json, path_lock
 from app.harness.tools.config import ToolConfig, load_tool_configs
 from app.harness.tools.registry import get_registry
 from app.settings import repo_root
@@ -46,7 +48,7 @@ class _Author(_StrictModel):
     top_p: float = Field(gt=0, le=1)
     thinking: Literal[True]
     reasoning_effort: Literal["low", "medium", "high", "max"]
-    timeout_seconds: float = Field(gt=0, le=360)
+    timeout_seconds: float = Field(gt=0, le=86400)
     max_retries: int = Field(ge=0, le=1)
     retry_base_delay_seconds: float = Field(ge=0, le=60)
     api_key_env: Literal["DEEPSEEK_API_KEY"]
@@ -195,13 +197,14 @@ def _overlay(original: AgentConfig, configured: _Lead | _Child) -> AgentConfig:
     if not policy.reflection_thinking_enabled or policy.reflection_reasoning_effort != "high":
         raise ValueError("experimental profile requires high-thinking review")
     raw = deepcopy(dict(original.raw))
+    timeout = model_request_timeout(max(original.request_timeout_seconds, model.timeout_seconds))
     raw["loop"] = asdict(policy)
     raw["research"] = {**raw.get("research", {}), **configured.research.model_dump(exclude_none=True)}
     # Keep raw and typed settings consistent for existing configuration readers.
     raw["model"] = {"provider": model.provider, "model": model.name, "max_tokens": model.max_tokens,
                     "temperature": model.temperature, "top_p": model.top_p,
                     "thinking": {"enabled": model.thinking}, "reasoning_effort": model.reasoning_effort,
-                    "request_timeout_seconds": model.timeout_seconds,
+                    "request_timeout_seconds": timeout,
                     "retry": {"max_retries": model.max_retries, "base_delay_seconds": model.retry_base_delay_seconds},
                     "api_key_env": model.api_key_env, "base_url": model.base_url, "base_url_env": model.base_url_env}
     raw["debate"] = {**raw.get("debate", {}), "enabled": False}
@@ -211,7 +214,7 @@ def _overlay(original: AgentConfig, configured: _Lead | _Child) -> AgentConfig:
         raw["tools"] = list(tools)
     return replace(original, model_provider=model.provider, model_name=model.name, max_tokens=model.max_tokens,
                    temperature=model.temperature, top_p=model.top_p, thinking_enabled=model.thinking,
-                   reasoning_effort=model.reasoning_effort, request_timeout_seconds=model.timeout_seconds,
+                   reasoning_effort=model.reasoning_effort, request_timeout_seconds=timeout,
                    max_retries=model.max_retries, retry_base_delay_seconds=model.retry_base_delay_seconds,
                    api_key_env=model.api_key_env, base_url=model.base_url, base_url_env=model.base_url_env,
                    debate_enabled=False, tools=tools, raw=raw)
@@ -275,7 +278,7 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def bind_profile_snapshot(run_root: Path, profile: ResolvedIdeaProfile | None, *, resume: bool = False) -> dict[str, Any] | None:
+def _bind_profile_snapshot(run_root: Path, profile: ResolvedIdeaProfile | None, *, resume: bool = False) -> dict[str, Any] | None:
     """Bind once before model selection; never rewrite a prior receipt or trace.
 
     A receipt only checks configuration identity. A matching receipt does not
@@ -303,18 +306,15 @@ def bind_profile_snapshot(run_root: Path, profile: ResolvedIdeaProfile | None, *
         raise ValueError("cannot adopt experimental profile for an existing run without its original profile receipt")
     snapshot = profile.snapshot()
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Exclusive creation forbids silently overwriting a competing binder. A
-    # partial file after a hard crash is intentionally rejected on the next read.
-    try:
-        with path.open("x", encoding="utf-8") as handle:
-            handle.write(canonical(snapshot) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        directory_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    except FileExistsError:
-        return bind_profile_snapshot(run_root, profile, resume=resume)
+    atomic_write_json(path, snapshot)
     return snapshot
+
+
+def bind_profile_snapshot(run_root: Path, profile: ResolvedIdeaProfile | None, *, resume: bool = False) -> dict[str, Any] | None:
+    path = run_root / SNAPSHOT_FILE
+    if path.is_symlink() or path.parent.is_symlink():
+        raise ValueError("Idea runtime profile receipt must be a local regular file")
+    if not path.exists() and (profile is None or resume):
+        return _bind_profile_snapshot(run_root, profile, resume=resume)
+    with path_lock(run_root / "input/.idea_runtime_profile.lock"):
+        return _bind_profile_snapshot(run_root, profile, resume=resume)

@@ -18,6 +18,7 @@ import zipfile
 
 from app.bridge.results_service import canonical, collect_run_results, load_results_policy, safe_path, sha256
 from app.storage.run_store import RunHandle
+from app.harness.persistence import rename_path
 
 
 def _display(value: Any) -> str:
@@ -189,7 +190,7 @@ def create_results_export(run: RunHandle) -> dict[str, Any]:
         (temporary / "results.zip").write_bytes(encoded)
         (temporary / "archive.sha256").write_text(sha256(encoded), encoding="ascii")
         (temporary / "manifest.json").write_bytes(files["manifest.json"])
-        temporary.rename(destination)
+        rename_path(temporary, destination)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
@@ -236,7 +237,7 @@ def read_results_export(run: RunHandle, export_id: str) -> bytes:
 
 
 def _bounded_file(path: Path, limit: int) -> bytes:
-    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > limit:

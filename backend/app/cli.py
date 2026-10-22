@@ -271,7 +271,7 @@ async def doctor(repo: Path, data: Path, model: str, check_model: bool) -> dict[
     if check_model:
         try:
             provider, cfg = select_provider(replace(coding_config, model_name=model,
-                max_tokens=1024, max_retries=0, request_timeout_seconds=45))
+                max_tokens=1024, max_retries=0, request_timeout_seconds=720))
             try:
                 completion = await provider.complete([Message(role="user", content="Reply with READY only.")], cfg)
                 result["model_check"] = {"provider": completion.provider, "model": completion.model, "responded": bool(completion.text.strip())}

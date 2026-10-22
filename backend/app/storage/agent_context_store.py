@@ -6,6 +6,8 @@ prompts, examples, evals, and uploaded text/code can be edited from the UI.
 """
 from __future__ import annotations
 
+from app.harness.persistence import atomic_write_text, path_lock
+
 import re
 import hashlib
 import json
@@ -134,26 +136,8 @@ def load_agent_runtime_resources(
 @contextmanager
 def _resource_lock(path: Path) -> Iterator[None]:
     """Cross-process compare-and-swap lock shared by every context writer."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with (path.parent / (path.name + ".lock")).open("a+b") as handle:
-        if os.name == "nt":
-            import msvcrt
-            handle.seek(0)
-            handle.write(b"0")
-            handle.flush()
-            handle.seek(0)
-            getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                handle.seek(0)
-                getattr(msvcrt, "locking")(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    with path_lock(path.with_name(path.name + ".lock")):
+        yield
 
 
 def _write_context_atomic(path: Path, content: str, *, expected_sha256: str | None = None) -> None:
@@ -164,15 +148,7 @@ def _write_context_atomic(path: Path, content: str, *, expected_sha256: str | No
                 current.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n").encode()).hexdigest()}
             if expected_sha256.removeprefix("sha256:") not in hashes:
                 raise ValueError("agent context changed after evaluation; re-evaluate before applying")
-        descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
-                handle.write(content)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, path)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+        atomic_write_text(path, content)
 
 DEFAULT_RESEARCH_SITES: tuple[Mapping[str, object], ...] = (
     {

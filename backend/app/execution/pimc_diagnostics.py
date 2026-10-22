@@ -6,6 +6,8 @@ cannot accidentally enter plots or research context through this module.
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import importlib
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,7 @@ def save_figure(figure: Any, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.stem + ".tmp.png")
     figure.savefig(temporary, dpi=140, bbox_inches="tight")
-    temporary.replace(path)
+    replace_complete_file(temporary, path)
 
 
 def data_diagnostics(torch: Any, np: Any, train: dict[str, Any], cfg: dict[str, Any],

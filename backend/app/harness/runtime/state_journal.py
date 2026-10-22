@@ -5,6 +5,8 @@ remains the scheduler. Delivery is at least once; consumers deduplicate event_id
 """
 from __future__ import annotations
 
+from app.harness.persistence import fsync_directory, replace_complete_file
+
 import json
 import os
 import sqlite3
@@ -15,7 +17,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from app.harness.persistence import fsync_directory
 
 
 class RunStateConflictError(ValueError):
@@ -103,7 +104,7 @@ class StateJournal:
                                        (payload["revision"], self._encode(payload)))
             finally:
                 connection.close()
-            os.replace(temporary, self.path)
+            replace_complete_file(temporary, self.path)
             fsync_directory(self.path.parent)
         finally:
             temporary.unlink(missing_ok=True)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from app.harness.persistence import atomic_write_text
 
 from app.agents.idea.discovery.models import (
     DeepDiscoveryState,
@@ -115,13 +116,10 @@ class RunLocalDiscoveryStore:
     def _write_json(self, name: str, payload: object) -> None:
         assert self.root is not None
         path = self.root / name
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        temporary.write_text(
+        atomic_write_text(path,
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str)
             + "\n",
-            encoding="utf-8",
         )
-        temporary.replace(path)
 
 
 def pool_view(state: DeepDiscoveryState) -> HypothesisPoolView:

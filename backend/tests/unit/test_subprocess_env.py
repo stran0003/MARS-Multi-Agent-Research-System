@@ -23,4 +23,6 @@ def test_explicit_pack_pythonpath_is_allowed_but_explicit_secrets_are_not() -> N
         "PATH": "/usr/bin",
         "PYTHONPATH": "/trusted/project-pack/src",
         "PACK_MODE": "cpu",
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8",
     }

@@ -150,6 +150,8 @@ def test_broken_sse_cannot_be_mistaken_for_an_executable_tool_call(broken: str) 
     elif broken == 'error_event':
         events.append({'error': {'message': 'private-service-data'}})
     body = _sse(events) if broken != 'bad_json' else 'data: {"choices":\n\ndata: [DONE]\n\n'
+    if broken == 'truncated':
+        body = body.replace('data: [DONE]\r\n\r\n', '')
     provider = ZhipuProvider(api_key='parser-only')
     config = LLMConfig(provider='zhipu', model='GLM-V5.2', tools=() if broken == 'unsolicited' else ({'type': 'function'},))
     with pytest.raises((LLMCompletionError, ValueError)) as caught:
@@ -165,4 +167,8 @@ def test_external_coding_wire_also_decodes_sse_tool_arguments() -> None:
     assert call['id'] == 'actual-call-id' and call['function']['name'] == 'mars_list_runs'
     assert json.loads(call['function']['arguments']) == {'project': '原始项目'}
     assert result['choices'][0]['finish_reason'] == 'tool_calls' and result['usage']['total_tokens'] == 15
-    assert 'private-parser-marker' not in repr(result)
+    # The private ZCode wire must carry reasoning history for the next tool
+    # turn, just as a JSON completion does. Public Completion excludes it.
+    assert result['choices'][0]['message']['reasoning_content'] == 'private-parser-marker' * 2
+    assert 'private-parser-marker' not in repr(provider._completion_from_response(result,
+        LLMConfig(provider='zhipu', model='GLM-V5.2', tools=({'type': 'function'},))))

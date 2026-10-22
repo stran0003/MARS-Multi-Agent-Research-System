@@ -44,39 +44,59 @@ def fsync_directory(directory: Path) -> None:
         os.close(descriptor)
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_text(path: Path, text: str, *, newline: str | None = "") -> None:
     """Publish only complete UTF-8 contents; callers lock multi-step writes."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     temporary = Path(name)
     try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline=newline) as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
-        _replace_complete_file(temporary, path)
+        # Retain executable/read-only attributes instead of silently changing
+        # existing research code permissions to mkstemp's restrictive default.
+        if os.name != "nt" and path.exists():
+            os.chmod(temporary, path.stat().st_mode & 0o777)
+        replace_complete_file(temporary, path)
         fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
 
-def _replace_complete_file(temporary: Path, path: Path) -> None:
+def replace_complete_file(temporary: Path | str, path: Path | str, *, timeout: float = 5.0) -> None:
     """Allow a Windows reader to close its handle before atomic replacement.
 
     Windows readers and virus scanners can briefly deny delete sharing. Keep
     the complete temporary file intact and retry only these OS errors, for at
-    most two seconds. Permanent permissions and other errors still propagate.
+    most five seconds. Permanent permissions and other errors still propagate.
+    Never move the old target away or fall back to truncating it. This also
+    accepts prepared binary files, SQLite snapshots and directories.
     """
-    deadline = time.monotonic() + 2.0
+    _move_complete_path(temporary, path, timeout=timeout, replace=True)
+
+
+def rename_path(source: Path | str, destination: Path | str, *, timeout: float = 5.0) -> None:
+    """Retry Windows sharing violations while retaining os.rename semantics."""
+    _move_complete_path(source, destination, timeout=timeout, replace=False)
+
+
+def _move_complete_path(source: Path | str, destination: Path | str, *, timeout: float, replace: bool) -> None:
+    deadline = time.monotonic() + timeout
+    delay = 0.01
     while True:
         try:
-            os.replace(temporary, path)
+            if replace:
+                os.replace(source, destination)
+            else:
+                os.rename(source, destination)
             return
-        except PermissionError as error:
+        except OSError as error:
             if (os.name != "nt" or getattr(error, "winerror", None) not in {5, 32, 33}
                     or time.monotonic() >= deadline):
                 raise
-            time.sleep(0.01)
+            time.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+            delay = min(0.2, delay * 2)
 
 
 def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:

@@ -29,7 +29,7 @@ def test_idea_config_has_debate_participants() -> None:
     assert cfg.reasoning_effort == "low"
     assert cfg.max_tokens == 8_192
     assert cfg.top_p == 1.0
-    assert cfg.request_timeout_seconds == 360.0
+    assert cfg.request_timeout_seconds == 720.0
     assert cfg.max_retries == 2
 
 

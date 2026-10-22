@@ -53,7 +53,7 @@ def test_profile_is_idempotent_preserves_routes_and_restores_exact_original_byte
     agents = yaml.safe_load((tmp_path/'configs/agents.yaml').read_text())
     model = agents['commander']['model']
     assert (model['model'],model['base_url'],model['api_key_env']) == ('GLM-V5.2','http://company.invalid/v1','COMPANY_KEY')
-    assert model['request_timeout_seconds'] == 600 and model['max_tokens'] == 2048
+    assert model['request_timeout_seconds'] == 720 and model['max_tokens'] == 2048
     assert model['thinking']['enabled'] is False and 'reasoning_effort' not in model
     assert agents['idea']['model']['thinking']['enabled'] is True
     assert profile.configure(tmp_path)['status'] == 'already_applied'

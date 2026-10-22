@@ -100,7 +100,17 @@ class ProjectScope:
                 raise ValueError("Project capability directory is unavailable")
         for name, expected in self.metadata_hashes:
             path = safe_scope_path(self.metadata_root, name, must_exist=True)
-            if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            contents = path.read_bytes()
+            fingerprints = {hashlib.sha256(contents).hexdigest()}
+            # Older Windows writers hashed LF text then wrote CRLF. Limit
+            # compatibility to these frozen UTF-8 context documents; source,
+            # YAML execution inputs and result receipts keep byte fingerprints.
+            try:
+                normalized = contents.decode("utf-8").replace("\r\n", "\n")
+                fingerprints.add(hashlib.sha256(normalized.encode("utf-8")).hexdigest())
+            except UnicodeDecodeError:
+                pass
+            if expected not in fingerprints:
                 raise ValueError("Bound project context fingerprint changed")
 
     def resolve_file(self, relative: str, *, write: bool = False, must_exist: bool = False) -> Path:

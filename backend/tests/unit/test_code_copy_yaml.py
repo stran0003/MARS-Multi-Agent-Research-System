@@ -162,14 +162,14 @@ async def test_symlink_paths_do_not_redirect_copy(tmp_path: Path, location: str)
     (root / 'actual.yaml').write_text('previous: 7\n')
     source, target = 'source.yaml', 'next.yaml'
     if location == 'source':
-        (root / 'alias.yaml').symlink_to(root / source)
+        _symlink(root / 'alias.yaml', root / source)
         source = 'alias.yaml'
     elif location == 'destination':
-        (root / 'alias.yaml').symlink_to(root / 'actual.yaml')
+        _symlink(root / 'alias.yaml', root / 'actual.yaml')
         target = 'alias.yaml'
     else:
         (root / 'actual').mkdir()
-        (root / 'alias').symlink_to(root / 'actual', target_is_directory=True)
+        _symlink(root / 'alias', root / 'actual', directory=True)
         target = 'alias/next.yaml'
     result = await get_registry().dispatch('code.copy_yaml', {'source': source, 'variants': [{'path': target}]}, ctx)
     assert not result.ok
@@ -256,7 +256,7 @@ def contract_setup(tmp_path: Path) -> tuple[Any, Any, ToolContext]:
 
     source = tmp_path / 'source'
     source.mkdir()
-    (source / 'base.yaml').write_text('# baseline\nvalue: 1\n')
+    (source / 'base.yaml').write_bytes(b'# baseline\nvalue: 1\n')
     budget_raw = yaml.safe_load((Path(__file__).resolve().parents[3] / 'configs/research_defaults.yaml').read_text())['budget']
     budget = ResearchBudget.model_validate(budget_raw)
     project = ProjectContract.model_validate({'project_id': 'generic', 'display_name': 'YAML copy scope',
@@ -320,3 +320,12 @@ async def test_source_changed_after_contract_preparation_is_blocked_before_write
     assert not result.ok and 'source changed' in (result.error or '')
     assert execution.ledger.snapshot().used['tool_executions'] == 0
     assert not (scope.candidate_root / 'candidate.yaml').exists()
+
+
+def _symlink(path: Path, target: Path, *, directory: bool = False) -> None:
+    try:
+        path.symlink_to(target, target_is_directory=directory)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account lacks symlink privilege; real junction coverage is in test_code_repository")
+        raise

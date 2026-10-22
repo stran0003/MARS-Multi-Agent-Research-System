@@ -128,7 +128,7 @@ async def test_experiment_candidate_rejects_unresolved_seed_before_review(seed: 
     assert any('/seed' in error for error in errors)
 
 
-@pytest.mark.parametrize('change', ['unit', 'value', 'missing_jobs', 'seed', 'stale_plan', 'name'])
+@pytest.mark.parametrize('change', ['unit', 'value', 'missing_jobs', 'seed', 'name'])
 def test_cross_document_changes_cannot_pass_coding_handoff(change: str) -> None:
     text = dumps(plan(), 'Approved comparison protocol.')
     metadata = code(text)

@@ -101,7 +101,7 @@ class ResultReader:
 
     def read(self, relative: str, *, evidence: bool = False) -> bytes:
         path = safe_path(self.run.root, relative)
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0))
         with os.fdopen(descriptor, "rb") as stream:
             info = os.fstat(stream.fileno())
             limit = self.policy["max_evidence_file_bytes" if evidence else "max_input_file_bytes"]

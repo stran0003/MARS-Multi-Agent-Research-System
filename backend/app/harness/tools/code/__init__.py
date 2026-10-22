@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 
 from app.harness.project_workspace import project_root
+from app.harness.persistence import atomic_write_text
 from app.harness.runtime.git_runtime import GitRuntimeError, git_environment, resolve_git
 from app.harness.runtime.project_scope import current_project_scope, validated_diff_paths
 from app.harness.tools.config import check_commands, command_timeout_seconds, tool_config
@@ -167,8 +168,9 @@ async def write_file_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
     if ctx.dry_run:
         return ToolResult(ok=True, output={"dry_run": True, "path": rel})
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(content, encoding="utf-8", newline="")
-    rollback_ref = _write_rollback(ctx, "code.write_file", snapshots)
+    rollback_ref = _write_rollback(ctx, "code.write_file", snapshots,
+        after_snapshots=[FileSnapshot(rel, True, _sha_text(content), content)])
+    atomic_write_text(target, content)
     _record_branch_write(ctx, [rel])
     return ToolResult(
         ok=True,
@@ -288,7 +290,7 @@ async def apply_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult
         for snapshot in snapshots:
             target = root / snapshot.path
             if snapshot.existed:
-                target.write_text(snapshot.content, encoding='utf-8', newline='')
+                atomic_write_text(target, snapshot.content)
             else:
                 target.unlink(missing_ok=True)
         return ToolResult(ok=False, error=str(exc))
@@ -364,7 +366,7 @@ async def rollback_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolRes
         existed = bool(item.get("existed", False))
         if existed:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(str(item.get("content", "")), encoding="utf-8",
+            atomic_write_text(target, str(item.get("content", "")),
                 newline='' if data.get('text_mode') == 'utf8_exact' else None)
         elif target.exists():
             target.unlink()
@@ -565,7 +567,7 @@ def _write_patch_result(ctx: ToolContext, version: str, payload: dict[str, Any])
     if scope is not None:
         target = scope.run_file(f"coding/patch.{version}.approved.json")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
 
 
 def _project_root(ctx: ToolContext) -> Path | None:
@@ -708,7 +710,7 @@ def _write_rollback(ctx: ToolContext, tool_name: str, snapshots: list[FileSnapsh
     }
     if after_snapshots is not None:
         payload["after_snapshots"] = [asdict(item) for item in after_snapshots]
-    target.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
     return str(target)
 
 
@@ -780,7 +782,7 @@ def _bound_rollback(ctx: ToolContext, rollback_ref: str) -> ToolResult:
             for _name, target, existed, content in validated:
                 if existed:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content, encoding="utf-8",
+                    atomic_write_text(target, content,
                         newline='' if data.get('text_mode') == 'utf8_exact' else None)
                 elif target.exists():
                     target.unlink()

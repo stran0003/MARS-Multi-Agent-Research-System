@@ -25,13 +25,13 @@ research_author:
   thinking_enabled: true
   reasoning_effort: low
   max_tokens: 8192
-  request_timeout_seconds: 360
+  request_timeout_seconds: 720
   max_retries: 1
 generation:
   thinking_enabled: true
   reasoning_effort: low
   max_tokens: 8192
-  request_timeout_seconds: 360
+  request_timeout_seconds: 720
   max_retries: 1
 coding_loop:
   protocol: native_tools

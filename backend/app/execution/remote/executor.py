@@ -1,6 +1,8 @@
 """Recoverable SSH client for the durable remote GPU runner."""
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -298,7 +300,7 @@ class RemoteExecutor:
                     "artifact_hash_mismatch",
                     f"downloaded artifact '{artifact.name}' failed SHA-256 verification",
                 )
-            os.replace(partial_path, local_path)
+            replace_complete_file(partial_path, local_path)
             downloaded.append(
                 DownloadedArtifact(
                     name=artifact.name,

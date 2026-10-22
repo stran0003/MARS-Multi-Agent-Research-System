@@ -5,6 +5,8 @@ stash, reset, network pull, automatic merge, or data directory copy is used.
 """
 from __future__ import annotations
 
+from app.harness.persistence import rename_path
+
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -397,7 +399,7 @@ def _prepare(root: Path, run_root: Path, project: str, run_id: str) -> GitBranch
         atomic_json(intent_path, {"schema_id": "research.git_workspace_intent.v1", **asdict(branch)})
         atomic_json(_owner_path(staging, branch.branch), {"run_root": str(run_root.resolve()),
             "project": project, "run_id": run_id, "binding": asdict(branch)})
-        staging.rename(branch.root)
+        rename_path(staging, branch.root)
     branch.validate(project, run_id)
     if legacy:
         backup = path.with_name("research_branch.pre_isolation.json")

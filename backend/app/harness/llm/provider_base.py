@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
+import math
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -16,7 +17,20 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 Role = Literal["system", "user", "assistant", "tool"]
 ReasoningEffort = Literal["low", "medium", "high", "max"]
 MAX_LLM_RETRIES = 3
+DEFAULT_LLM_TIMEOUT_SECONDS = 720.0
 LLM_CALL_DEADLINE_GRACE_SECONDS = 5.0
+
+
+def model_request_timeout(value: Any = None) -> float:
+    """Migrate deployment settings to a slow-model floor, preserving longer waits.
+
+    Explicit per-operation deadlines (including cancellation tests) may still
+    use LLMConfig directly; this applies at configuration loading boundaries.
+    """
+    seconds = DEFAULT_LLM_TIMEOUT_SECONDS if value is None else float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Model request timeout must be finite and positive")
+    return max(DEFAULT_LLM_TIMEOUT_SECONDS, seconds)
 
 
 @dataclass(frozen=True)
@@ -60,7 +74,7 @@ class LLMConfig:
     response_schema: str | None = None
     thinking_enabled: bool | None = None
     reasoning_effort: ReasoningEffort | None = None
-    request_timeout_seconds: float = 120.0
+    request_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     max_retries: int = 3
     retry_base_delay_seconds: float = 1.0
     json_mode: bool = False

@@ -15,7 +15,7 @@ from app.harness.llm.accounting import guarded_complete
 from app.harness.llm.model_capabilities import setup_reasoning
 from app.harness.llm.model_registry import get_agent_config, select_provider
 from app.harness.llm.openai_provider import public_error_details
-from app.harness.llm.provider_base import LLMConfig, Message
+from app.harness.llm.provider_base import LLMConfig, Message, model_request_timeout
 from app.settings import repo_root
 
 
@@ -24,7 +24,7 @@ def probe_config(config: LLMConfig) -> LLMConfig:
     thinking, effort = setup_reasoning(config.provider, config.model)
     return replace(config, max_tokens=int(defaults["api_probe_max_tokens"]), max_retries=0,
                    thinking_enabled=thinking, reasoning_effort=effort,
-                   request_timeout_seconds=float(defaults["api_probe_timeout_seconds"]))
+                   request_timeout_seconds=model_request_timeout(defaults["api_probe_timeout_seconds"]))
 
 
 async def check(name: str, root: Path) -> dict[str, Any]:

@@ -19,6 +19,7 @@ import httpx
 from pypdf import PdfReader
 
 from app.harness.agent_loop.trace import atomic_json
+from app.harness.persistence import replace_complete_file
 from app.harness.tools.registry import ToolContext, ToolResult
 from app.settings import get_settings
 
@@ -363,7 +364,7 @@ async def _fetch_sources_tool(args: dict[str, Any], ctx: ToolContext, *, started
                     temporary = root / (uuid.uuid4().hex + ".archive.tmp")
                     try:
                         temporary.write_bytes(data)
-                        temporary.replace(target)
+                        replace_complete_file(temporary, target)
                     finally:
                         temporary.unlink(missing_ok=True)
                 row.update(download_path=str(target), sha256=sha, bytes=len(data), resource_aliases=sorted(aliases),

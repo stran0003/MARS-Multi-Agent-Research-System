@@ -1,6 +1,8 @@
 """Local dataset registry and lightweight preview generation."""
 from __future__ import annotations
 
+from app.harness.persistence import atomic_write_json, replace_complete_file
+
 import hashlib
 import importlib
 import json
@@ -18,7 +20,6 @@ from uuid import uuid4
 import numpy as np
 
 from app.harness.project_storage import project_storage_root, storage_roots
-from app.harness.persistence import atomic_write_json
 from app.harness.runtime.project_scope import safe_scope_path
 from app.settings import repo_root
 
@@ -1531,7 +1532,7 @@ def _write_simple_series_png(*, values: list[float], path: Path) -> None:
         f".{target.name}.{datetime.now(tz=timezone.utc).timestamp()}.tmp"
     )
     tmp.write_bytes(_png_bytes(width=width, height=height, pixels=pixels))
-    tmp.replace(target)
+    replace_complete_file(tmp, target)
 
 
 def _write_simple_series_grid_png(*, series: list[list[float]], path: Path) -> None:
@@ -1601,7 +1602,7 @@ def _write_simple_series_grid_png(*, series: list[list[float]], path: Path) -> N
         f".{target.name}.{datetime.now(tz=timezone.utc).timestamp()}.tmp"
     )
     tmp.write_bytes(_png_bytes(width=width, height=height, pixels=pixels))
-    tmp.replace(target)
+    replace_complete_file(tmp, target)
 
 
 def _draw_png_line(

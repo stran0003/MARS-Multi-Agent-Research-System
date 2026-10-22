@@ -116,14 +116,14 @@ class GlobalModelProfiles:
         model = {**raw.get('model', {}), 'provider': item['provider'], 'model': item['model'],
             'api_key_env': key_env, 'base_url_env': url_env, 'base_url': item['base_url'],
             'context_window': item['context_window'], 'runtime': runtime, 'thinking': {'enabled': thinking},
-            'max_tokens': 2048, 'request_timeout_seconds': 600, 'retry': {'max_retries': 0}}
+            'max_tokens': 2048, 'request_timeout_seconds': 720, 'retry': {'max_retries': 0}}
         model.pop('reasoning_effort', None)
         if effort is not None:
             model['reasoning_effort'] = effort
         raw['model'] = model
         return replace(base, raw=raw, model_provider=item['provider'], model_name=item['model'],
             api_key_env=key_env, base_url=item['base_url'], base_url_env=url_env, max_tokens=2048,
-            thinking_enabled=thinking, reasoning_effort=effort, request_timeout_seconds=600, max_retries=0)
+            thinking_enabled=thinking, reasoning_effort=effort, request_timeout_seconds=720, max_retries=0)
 
 
 def resolve_selected_agent_config(session: Any, base: AgentConfig) -> AgentConfig:

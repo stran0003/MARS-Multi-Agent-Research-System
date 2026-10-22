@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import stat
 from collections.abc import Iterator
 from pathlib import Path
@@ -104,8 +105,9 @@ def test_materializes_add_replace_idempotently_and_binds_code_identity(
     assert first.manifest_path.name not in {item.path for item in first.manifest.files}
     assert tuple(item.path for item in first.manifest.directories) == ("pkg",)
     assert first.manifest.root_mode == "0755"
-    for path in (*tuple(first.root.rglob("*.py")), first.manifest_path):
-        assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    if os.name != "nt":
+        for path in (*tuple(first.root.rglob("*.py")), first.manifest_path):
+            assert stat.S_IMODE(path.stat().st_mode) == 0o644
     assert verify_code_workspace(first.root).manifest == first.manifest
     assert (
         verify_code_workspace(
@@ -553,8 +555,10 @@ def test_manifest_covers_all_directories_and_enforces_0755_modes(
         bundle=bundle,
         allowed_paths=("pkg",),
     )
-    assert stat.S_IMODE(workspace.root.stat().st_mode) == 0o755
-    assert stat.S_IMODE((workspace.root / "pkg").stat().st_mode) == 0o755
+    assert workspace.manifest.root_mode == "0755"
+    if os.name != "nt":
+        assert stat.S_IMODE(workspace.root.stat().st_mode) == 0o755
+        assert stat.S_IMODE((workspace.root / "pkg").stat().st_mode) == 0o755
 
     empty = workspace.root / "empty"
     empty.mkdir()
@@ -567,6 +571,18 @@ def test_manifest_covers_all_directories_and_enforces_0755_modes(
     with pytest.raises(MaterializationError, match="hard-forbidden directory"):
         verify_code_workspace(workspace.root)
     forbidden.rmdir()
+
+    # Windows newlines and pretty-printing do not alter this manifest's meaning.
+    payload = workspace.manifest.model_dump(mode="json")
+    workspace.manifest_path.write_bytes(json.dumps(payload, indent=2).replace("\n", "\r\n").encode())
+    reformatted = verify_code_workspace(workspace.root)
+    assert reformatted.manifest == workspace.manifest
+    assert reformatted.manifest_sha256 == content_sha256(workspace.manifest_path.read_bytes())
+
+    if os.name == "nt":
+        # NTFS ACLs do not encode these POSIX mode bits.
+        verify_code_workspace(workspace.root)
+        return
 
     package = workspace.root / "pkg"
     package.chmod(0o777)

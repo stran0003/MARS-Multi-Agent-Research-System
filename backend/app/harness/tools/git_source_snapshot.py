@@ -1,6 +1,8 @@
 """Freeze pending source-code inputs without writing the source Git index."""
 from __future__ import annotations
 
+from app.harness.persistence import rename_path
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fnmatch import fnmatchcase
@@ -196,7 +198,7 @@ def capture_source_snapshot(source: Path, run_root: Path, project: str, run_id: 
             'captured_at': datetime.now(timezone.utc).isoformat(), 'files': records, 'excluded': skipped}
         atomic_json(temporary / 'manifest.json', manifest)
         (temporary / 'manifest.json').chmod(0o444)
-        temporary.rename(_directory(run_root))
+        rename_path(temporary, _directory(run_root))
         return SourceSnapshot(_directory(run_root), manifest)
     except BaseException:
         for copied in (temporary / 'files').rglob('*'):

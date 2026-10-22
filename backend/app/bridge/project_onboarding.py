@@ -1,6 +1,9 @@
 """Save project background as README reference material and bind baseline code."""
 from __future__ import annotations
 
+from app.harness.persistence import atomic_write_text, fsync_directory, path_lock, rename_path, replace_complete_file
+
+
 from pathlib import Path, PurePosixPath
 from typing import Any
 import os
@@ -11,7 +14,6 @@ import shutil
 import yaml
 
 from app.harness.context.folder_context import discover_folder_context
-from app.harness.persistence import atomic_write_text, fsync_directory, path_lock
 from app.harness.project_workspace import FolderProject
 from app.harness.runtime.project_scope import safe_scope_path
 from app.settings import get_settings
@@ -81,7 +83,7 @@ def save_background(project: FolderProject, filename: str, data: bytes) -> dict[
             return result
         except Exception:
             if previous is not None:
-                os.replace(previous, target)
+                replace_complete_file(previous, target)
                 fsync_directory(previous.parent)
             else:
                 target.unlink(missing_ok=True)
@@ -223,7 +225,7 @@ def _import_code(project: FolderProject, source: Path) -> Path:
         run_git(("-C", str(staging), "add", "."))
         run_git(("-C", str(staging), "-c", "user.name=MARS", "-c", "user.email=mars@localhost",
                  "commit", "-m", "Import project baseline snapshot"))
-        staging.rename(target)
+        rename_path(staging, target)
         receipt = safe_scope_path(project.root, f".mars/code-imports/{token}.yaml")
         receipt.parent.mkdir(parents=True, exist_ok=True)
         atomic_write_text(receipt, yaml.safe_dump({"schema": "code_import.v1", "source": str(source),
@@ -338,7 +340,7 @@ def import_existing_workspace(project: FolderProject, *, legacy_root: Path | Non
             staging = target.with_name(".import-" + uuid.uuid4().hex)
             try:
                 shutil.copytree(source, staging, ignore=reject_links)
-                staging.rename(target)
+                rename_path(staging, target)
                 if owner is not None:
                     atomic_write_text(owner, json.dumps({"legacy_source": str(source)}))
             except Exception:

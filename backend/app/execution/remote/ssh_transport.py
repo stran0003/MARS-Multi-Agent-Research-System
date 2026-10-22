@@ -6,6 +6,8 @@ or authentication fallback is used. This layer does not certify GPU readiness.
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import asyncio
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
@@ -311,7 +313,7 @@ class AsyncSshTransport:
                                 output.flush()
                                 os.fsync(output.fileno())
                             _plain_local_path(local_path, allow_missing=True)
-                            os.replace(temporary, local_path)
+                            replace_complete_file(temporary, local_path)
                         finally:
                             Path(temporary).unlink(missing_ok=True)
             return TransportResult(("sftp", operation), 0)

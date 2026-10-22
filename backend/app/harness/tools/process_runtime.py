@@ -35,6 +35,11 @@ def sanitized_subprocess_environment(
     source = os.environ if inherited is None else inherited
     result = {name: value for name, value in source.items() if not blocked(name) and not secret(name)}
     result.update({str(name): str(value) for name, value in (overrides or {}).items() if not secret(name)})
+    # MARS control files use UTF-8, including Chinese project paths. A child
+    # must not silently reinterpret them using the Windows GBK code page.
+    # Explicit operator encodings remain possible for legacy research code.
+    result.setdefault("PYTHONUTF8", "1")
+    result.setdefault("PYTHONIOENCODING", "utf-8")
     return result
 
 
@@ -86,7 +91,7 @@ async def terminate_process_tree(process: asyncio.subprocess.Process) -> None:
             await killer.wait()
     else:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
+            getattr(os, "killpg")(process.pid, getattr(signal, "SIGKILL"))
         except ProcessLookupError:
             pass
     await process.wait()
@@ -136,7 +141,7 @@ class CapturedProcessStream:
 
     async def consume(self, reader: asyncio.StreamReader | None) -> None:
         marker = b'\n[MARS: log truncated at configured byte limit; see execution_receipt.json]\n'
-        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
         with os.fdopen(descriptor, 'wb') as output:
             if reader is None:
                 self.complete = True

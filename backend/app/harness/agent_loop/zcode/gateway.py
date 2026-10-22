@@ -17,7 +17,7 @@ from app.harness.agent_loop.zcode.config import ZCodeConfig
 from app.harness.agent_loop.zcode.limits import invocation_limits
 from app.harness.llm.accounting import ResourceBudgetError, guarded_complete
 from app.harness.llm.provider_base import Completion, Delta, LLMConfig, LLMProvider, Message
-from app.harness.schema.frontmatter_parser import dumps
+from app.harness.schema.frontmatter_parser import document_from_parts
 
 WireCall = Callable[[dict[str, Any], LLMConfig], Awaitable[dict[str, Any]]]
 
@@ -28,10 +28,13 @@ def completion_payload(payload: dict[str, Any], config: LLMConfig) -> dict[str, 
     # ZCode requests streaming, but the budgeted host call returns one response.
     # DeepSeek rejects stream_options when stream is false.
     result.pop("stream_options", None)
-    if config.thinking_enabled is not None:
+    if config.thinking_enabled is not None and config.provider in {"deepseek", "zhipu"}:
         result["thinking"] = {"type": "enabled" if config.thinking_enabled else "disabled"}
     if config.reasoning_effort:
         result["reasoning_effort"] = config.reasoning_effort
+    if config.extra.get("gateway_plain_request") is True:
+        for key in ("thinking", "reasoning_effort", "response_format", "parallel_tool_calls", "top_p", "chat_template_kwargs"):
+            result.pop(key, None)
     return result
 
 
@@ -272,11 +275,12 @@ class ZCodeGateway:
         if self.state["status"] != "running":
             return mcp_result({"error": "MARS invocation stopped"}, error=True)
         if name == "mars_submit_document" and self.request.final_schema:
-            if set(args) != {"metadata", "body"} or not isinstance(args["metadata"], dict) or not isinstance(args["body"], str):
-                return mcp_result({"error": "Supply metadata and body"}, error=True)
-            if args["body"].lstrip().startswith("---\n"):
-                return mcp_result({"error": "Body is Markdown only; put frontmatter fields in metadata, without duplicate YAML"}, error=True)
-            candidate = dumps(args["metadata"], args["body"])
+            try:
+                if {"tool", "args", "observations", "actions", "approved", "approval", "decision_rule"}.intersection(args):
+                    raise ValueError("Document submission cannot contain tool actions or observations")
+                candidate = document_from_parts(args.get("metadata"), args.get("body", ""))
+            except ValueError as exc:
+                return mcp_result({"error": str(exc)}, error=True)
             await self.progress("candidate")
             errors = await self.request.validate(candidate, self.state["history"])
             self.trace.emit("validation", {"errors": errors}, visible=candidate)

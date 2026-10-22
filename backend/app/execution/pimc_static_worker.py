@@ -7,6 +7,8 @@ This process isolation is not an OS security sandbox for hostile Python code.
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import argparse
 import importlib
 import importlib.util
@@ -185,7 +187,7 @@ def _train_observed(torch: Any, np: Any, evaluator: Any, model: Any, splits: dic
             selected = {**row}
             temporary = out / "best.tmp.pt"
             torch.save({"model": model.state_dict()}, temporary)
-            temporary.replace(out / "best.pt")
+            replace_complete_file(temporary, out / "best.pt")
         curve = training_curve(training_steps, validation_history, out)
         if completed >= cfg["max_steps"] or epoch-best_epoch >= cfg["patience"]:
             break

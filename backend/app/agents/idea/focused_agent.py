@@ -21,7 +21,7 @@ from app.agents.idea.literature_quality import quality_errors, quality_policy, q
 from app.agents.idea.runtime_profile import public_agent_configuration
 from app.harness.agent_loop.trace import atomic_json, digest
 from app.harness.llm.model_registry import get_agent_config, select_provider
-from app.harness.llm.provider_base import LLMConfig, LLMProvider, Message
+from app.harness.llm.provider_base import LLMConfig, LLMProvider, Message, model_request_timeout
 from app.harness.schema.frontmatter_parser import parse
 from app.harness.agent_loop.stop import LoopStop, LoopStopView, StopCondition
 from app.harness.agent_loop.revision_seed import RevisionSeed, load_revision_seed, load_failed_revision_seed
@@ -84,7 +84,7 @@ class FocusedIdeaAgent(IdeaAgent):
 
     def __init__(self, *, author_settings: dict[str, Any] | None = None) -> None:
         path = repo_root() / "configs/idea_focused.yaml"
-        settings = yaml.safe_load(path.read_text())
+        settings = yaml.safe_load(path.read_text(encoding="utf-8"))
         if author_settings is not None:
             settings["author"] = {**settings["author"], **author_settings}
         if not get_settings().mars_web_search_provider:
@@ -99,6 +99,8 @@ class FocusedIdeaAgent(IdeaAgent):
             (self._review_config.model_provider, self._review_config.model_name), settings.get("review_mode", "cross_model"))
         author = replace(original, tools=tuple(settings["tools"]), raw=raw, debate_enabled=False,
                          **settings["author"])
+        author = replace(author, request_timeout_seconds=model_request_timeout(
+            max(original.request_timeout_seconds, author.request_timeout_seconds)))
         if (author.thinking_enabled and settings["loop"]["protocol"] == "native_tools"
                 and not settings["loop"].get("native_observation_history")):
             raise ValueError("thinking author requires explicit observation history for native tools")

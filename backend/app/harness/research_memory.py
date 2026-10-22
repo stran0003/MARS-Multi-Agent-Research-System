@@ -5,6 +5,8 @@ and intact measured evidence. Baseline pointers are explicit and never auto-prom
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import hashlib
 import json
 import math
@@ -135,7 +137,7 @@ class ResearchMemory:
                         dst.write(block)
                 if sha_file(temp) != checksum:
                     raise ValueError("导入期间证据发生变化，请重试")
-                temp.replace(target)
+                replace_complete_file(temp, target)
             finally:
                 temp.unlink(missing_ok=True)
         elif sha_file(target) != checksum:

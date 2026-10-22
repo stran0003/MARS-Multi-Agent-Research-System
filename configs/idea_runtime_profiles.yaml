@@ -15,7 +15,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: low
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -46,7 +46,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: high
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -82,7 +82,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: low
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -114,7 +114,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: high
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -151,7 +151,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: low
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -183,7 +183,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: high
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -220,7 +220,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: low
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -263,7 +263,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: high
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -301,7 +301,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: low
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -344,7 +344,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: high
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -382,7 +382,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: low
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY
@@ -427,7 +427,7 @@ profiles:
         top_p: 1.0
         thinking: true
         reasoning_effort: high
-        timeout_seconds: 360
+        timeout_seconds: 720
         max_retries: 1
         retry_base_delay_seconds: 1
         api_key_env: DEEPSEEK_API_KEY

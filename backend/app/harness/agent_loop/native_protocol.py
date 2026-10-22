@@ -109,8 +109,8 @@ def native_decision(completion: Completion, tools: tuple[str, ...], *, structure
                     or not isinstance(document.get(body_field), str) or not document[body_field].strip()):
                 raise ValueError(f"submit metadata fields directly, including nonempty {body_field}; no metadata/body wrapper")
             document = {"metadata": document, "body": document[body_field]}
-        elif not isinstance(document, dict) or set(document) != {"metadata", "body"}:
-            raise ValueError("document arguments require exactly metadata and body")
+        elif not isinstance(document, dict) or "metadata" not in document:
+            raise ValueError("document arguments require metadata and optional body")
         return {**parse_action(json.dumps({"final": document}, ensure_ascii=False, allow_nan=False)),
                 **({"format_compatibility": compatibility} if compatibility else {}),
                 "submission_id": call.id}

@@ -126,13 +126,15 @@ def test_plain_native_wire_keeps_tools_but_omits_gateway_specific_optional_field
     assert not ({'reasoning_effort', 'extra_body', 'response_format', 'parallel_tool_calls', 'top_p'} & set(request))
 
 
-def test_operator_selected_qwen_template_disables_default_thinking_and_merges_system_first() -> None:
+def test_plain_gateway_does_not_force_optional_thinking_controls_and_merges_system_first() -> None:
     provider = CustomEndpointProvider(api_key='serializer-only', base_url='http://company.invalid/v1')
     config = LLMConfig(provider='custom', model='original-internal-alias', thinking_enabled=False, extra={
         'gateway_plain_request': True, 'template_family': 'qwen38_instruct', 'system_message_mode': 'merge_first'})
     messages = [Message('system', 'first instruction'), Message('user', 'user request'), Message('system', 'final constraint')]
     request = provider._request_kwargs(messages, config)
-    assert request['extra_body'] == {'chat_template_kwargs': {'enable_thinking': False, 'preserve_thinking': False}}
+    assert 'extra_body' not in request
+    explicit = provider._request_kwargs(messages, replace(config, extra={**config.extra, 'gateway_plain_request': False}))
+    assert explicit['extra_body'] == {'chat_template_kwargs': {'enable_thinking': False, 'preserve_thinking': False}}
     assert request['messages'] == [{'role': 'system', 'content': 'first instruction\n\nfinal constraint'},
                                   {'role': 'user', 'content': 'user request'}]
     minimal = provider._request_kwargs(messages, replace(config, extra={**config.extra, 'gateway_omit_template_options': True}))

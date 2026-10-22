@@ -520,7 +520,7 @@ def _read_cas_text(blob_root: Path, digest: str) -> str:
             raise CandidateWorkspaceError("code blob path contains a symlink")
     try:
         path.resolve(strict=True).relative_to(resolved_root)
-        flags = os.O_RDONLY
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         if hasattr(os, "O_NONBLOCK"):

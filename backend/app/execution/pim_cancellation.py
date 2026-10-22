@@ -17,6 +17,8 @@ Pure numpy. ~30k complex points trains in well under a second on CPU.
 """
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import os
 import json
 import struct
@@ -693,7 +695,7 @@ else:
         except OSError:
             pass
         return False
-    tmp_image.replace(target)
+    replace_complete_file(tmp_image, target)
     return _looks_like_png(target)
 
 
@@ -735,7 +737,7 @@ def _save_figure(fig: Any, plt: Any, path: str | Path) -> None:
     tmp = target.with_name(f".{target.name}.{wall_time.time_ns()}.tmp")
     try:
         fig.savefig(tmp, format=image_format)
-        tmp.replace(target)
+        replace_complete_file(tmp, target)
     finally:
         plt.close(fig)
         if tmp.exists():
@@ -784,7 +786,7 @@ def _write_simple_loss_png(*, loss_curve: list[float], path: str | Path, value_s
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f".{target.name}.{wall_time.time_ns()}.tmp")
     tmp.write_bytes(_png_bytes(width=width, height=height, pixels=pixels))
-    tmp.replace(target)
+    replace_complete_file(tmp, target)
 
 
 def _draw_png_line(

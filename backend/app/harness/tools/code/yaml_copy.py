@@ -1,6 +1,8 @@
 """Lossless YAML configuration copies with explicitly scoped scalar changes."""
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 from copy import deepcopy
 from dataclasses import dataclass
 import json
@@ -257,7 +259,7 @@ async def copy_yaml(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if rollback_ref is None:
             raise YamlCopyError('a current run directory is required for the YAML copy rollback receipt')
         for item, temporary in staged:
-            os.replace(temporary, item.target)
+            replace_complete_file(temporary, item.target)
             applied.append(item)
         code._record_branch_write(ctx, [item.path for item in prepared])
         return ToolResult(ok=True, output={'files': files, 'source': source_rel, 'source_sha256': source_hash, 'applied': True},
@@ -275,7 +277,7 @@ async def copy_yaml(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
                         with os.fdopen(descriptor, 'wb') as stream:
                             stream.write(item.before)
                         os.chmod(temporary, item.mode)
-                        os.replace(temporary, item.target)
+                        replace_complete_file(temporary, item.target)
                     finally:
                         temporary.unlink(missing_ok=True)
             except OSError as restore_error:

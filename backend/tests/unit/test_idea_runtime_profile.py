@@ -88,7 +88,7 @@ def test_profile_adopts_declared_variant_models_protocol_and_budgets(profile: Re
     for role, model_key, loop_key in (("lead", "model", "loop"), ("child", "child_model", "child_loop")):
         effective = snapshot["configuration"][role]
         for key, value in scenario[model_key].items():
-            assert effective["model"][key] == value
+            assert effective["model"][key] == (max(720, value) if key == "timeout_seconds" else value)
         expected_loop = asdict(AgentLoopPolicy.from_mapping(scenario[loop_key]))
         expected_loop.pop("native_observation_history")  # Omitted opt-in preserves historical receipts.
         assert effective["loop"] == expected_loop
@@ -117,6 +117,15 @@ def test_raw_model_and_typed_configuration_are_consistent(profile: ResolvedIdeaP
         assert model["reasoning_effort"] == config.reasoning_effort
         assert model["retry"]["max_retries"] == config.max_retries
         assert not config.debate_enabled and not config.raw["debate"]["enabled"]
+
+
+def test_profile_does_not_shorten_an_existing_long_model_timeout() -> None:
+    raw = yaml.safe_load((repo_root() / PROFILE_FILE).read_text(encoding="utf-8"))
+    definition = _Definition.model_validate(raw["profiles"]["experimental_research_pro_per_insight_v1"])
+    original = replace(get_agent_config("idea"), request_timeout_seconds=3600)
+    config = _overlay(original, definition.lead)
+    assert config.request_timeout_seconds == 3600
+    assert config.raw["model"]["request_timeout_seconds"] == 3600
 
 
 def test_v2_only_enables_author_empty_completion_repair_with_original_budgets(profile: ResolvedIdeaProfile) -> None:
@@ -214,7 +223,12 @@ def test_receipt_symlink_is_never_followed(tmp_path: Path, profile: ResolvedIdea
     external.write_text("Caller-owned file; not an execution artifact.")
     path = tmp_path / SNAPSHOT_FILE
     path.parent.mkdir()
-    path.symlink_to(external)
+    try:
+        path.symlink_to(external)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows account lacks symlink privilege")
+        raise
     with pytest.raises(ValueError, match="regular file"):
         bind_profile_snapshot(tmp_path, profile)
     assert external.read_text() == "Caller-owned file; not an execution artifact."

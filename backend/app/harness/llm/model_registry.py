@@ -9,7 +9,7 @@ from typing import Any, cast
 
 import yaml
 
-from app.harness.llm.provider_base import LLMConfig, LLMProvider, ReasoningEffort
+from app.harness.llm.provider_base import LLMConfig, LLMProvider, ReasoningEffort, DEFAULT_LLM_TIMEOUT_SECONDS, model_request_timeout
 from app.settings import env_or_local, get_settings, repo_root
 
 
@@ -33,7 +33,7 @@ class AgentConfig:
     base_url_env: str = ""
     thinking_enabled: bool = False
     reasoning_effort: ReasoningEffort | None = None
-    request_timeout_seconds: float = 120.0
+    request_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     max_retries: int = 3
     retry_base_delay_seconds: float = 1.0
 
@@ -128,8 +128,8 @@ def _agents_config() -> dict[str, AgentConfig]:
                 if reasoning_effort_raw
                 else None
             ),
-            request_timeout_seconds=float(
-                model.get("request_timeout_seconds", 120.0)
+            request_timeout_seconds=model_request_timeout(
+                model.get("request_timeout_seconds")
             ),
             max_retries=int(retry.get("max_retries", 3)),
             retry_base_delay_seconds=float(

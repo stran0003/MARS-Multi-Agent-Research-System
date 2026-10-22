@@ -27,7 +27,7 @@ class BrowsePolicy:
 
     @classmethod
     def load(cls) -> BrowsePolicy:
-        raw = yaml.safe_load((repo_root() / 'configs/code_review.yaml').read_text())['repository']
+        raw = yaml.safe_load((repo_root() / 'configs/code_review.yaml').read_text(encoding='utf-8'))['repository']
         return cls(**{key: int(raw[key]) for key in cls.__dataclass_fields__})
 
 

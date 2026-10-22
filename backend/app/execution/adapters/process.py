@@ -211,7 +211,7 @@ def _copy_bound_regular_file(
     expected_size: int | None,
     max_bytes: int,
 ) -> None:
-    source_flags = os.O_RDONLY
+    source_flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         source_flags |= os.O_NOFOLLOW
     try:
@@ -231,7 +231,7 @@ def _copy_bound_regular_file(
         try:
             destination_descriptor = os.open(
                 destination,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
                 0o600,
             )
         except OSError as exc:
@@ -255,7 +255,8 @@ def _copy_bound_regular_file(
         if actual_sha256 != expected_sha256:
             raise CodeWorkspaceTransferError(f"{label} hash mismatch")
         os.fsync(destination_descriptor)
-        os.fchmod(destination_descriptor, 0o644)
+        if os.name != "nt":
+            getattr(os, "fchmod")(destination_descriptor, 0o644)
         published = True
     finally:
         os.close(source_descriptor)

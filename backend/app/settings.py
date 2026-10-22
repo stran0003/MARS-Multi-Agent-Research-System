@@ -117,7 +117,7 @@ class Settings(BaseSettings):
     mars_folder_context_max_files: int = Field(default=100, ge=1, le=1000)
     # Explicit service-start alternative; baseline remains configs/agents.yaml.
     mars_idea_runtime_profile: Literal["focused_v1", "baseline", "experimental_research_pro_per_insight_v1", "experimental_research_pro_per_insight_v2", "experimental_research_pro_per_insight_v3", "experimental_research_pro_per_insight_v4", "experimental_research_pro_per_insight_v5", "experimental_research_pro_per_insight_v6"] = "focused_v1"
-    mars_llm_timeout_seconds: float = 90.0
+    mars_llm_timeout_seconds: float = 720.0
     mars_enable_network_tools: bool = True
     mars_source_max_mib: int = Field(default=12, ge=1, le=64)
     mars_source_connect_timeout_seconds: float = Field(default=15, ge=1, le=60)

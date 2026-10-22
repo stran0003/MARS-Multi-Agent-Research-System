@@ -1,6 +1,8 @@
 """Content-addressed, read-only source snapshots for isolated candidates."""
 from __future__ import annotations
 
+from app.harness.persistence import replace_complete_file
+
 import hashlib
 import json
 import os
@@ -154,7 +156,7 @@ def create_snapshot(
         (temporary / _SNAPSHOT_MANIFEST).chmod(0o444)
         _make_directories_read_only(temporary)
         try:
-            os.replace(temporary, destination)
+            replace_complete_file(temporary, destination)
         except FileExistsError:
             shutil.rmtree(temporary)
         return verify_snapshot(destination)
@@ -272,7 +274,7 @@ def materialize_candidate_workspace(
         }
         _write_json(temporary / _WORKSPACE_MARKER, marker_payload)
         try:
-            os.replace(temporary, destination)
+            replace_complete_file(temporary, destination)
         except FileExistsError:
             shutil.rmtree(temporary)
         marker = _read_workspace_marker(destination)

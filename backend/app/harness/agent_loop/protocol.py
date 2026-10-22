@@ -5,9 +5,8 @@ import json
 import math
 from typing import Any
 
-import yaml
-
 from app.harness.llm.provider_base import Message
+from app.harness.schema.frontmatter_parser import document_from_parts
 from app.harness.agent_loop.trace import digest
 from app.harness.llm.structured_output import StructuredOutputError, parse_json_object
 
@@ -117,15 +116,9 @@ def parse_action(text: str) -> dict[str, Any]:
         raise ValueError("action must be one JSON object")
     if set(action) == {"final"} and isinstance(action["final"], dict):
         final = action["final"]
-        if set(final) != {"metadata", "body"}:
-            raise ValueError("structured final requires exactly metadata and body")
-        if not isinstance(final["metadata"], dict) or not final["metadata"]:
-            raise ValueError("final.metadata must be a nonempty JSON object")
-        if not isinstance(final["body"], str) or not final["body"].strip():
-            raise ValueError("final.body must be nonempty Markdown")
-        # Serialization only: no schema defaults, invented fields, or content repair.
-        frontmatter = yaml.safe_dump(final["metadata"], allow_unicode=True, sort_keys=False)
-        return {"final": "---\n" + frontmatter + "---\n\n" + final["body"]}
+        if {"tool", "args", "observations", "actions", "approved", "approval", "decision_rule"}.intersection(final):
+            raise ValueError("document submission cannot contain tool actions or observations")
+        return {"final": document_from_parts(final.get("metadata"), final.get("body", ""))}
     if set(action) == {"final"} and isinstance(action["final"], str) and action["final"].strip():
         return action
     if set(action) - {"tool", "args", "reason"}:
@@ -141,8 +134,9 @@ def parse_action(text: str) -> dict[str, Any]:
 
 def parse_review(text: str) -> dict[str, Any]:
     result = parse_json_object(text, object_pairs_hook=_unique_object, parse_constant=_reject_constant, parse_float=_finite_float)
-    if not isinstance(result, dict) or set(result) != {"accept", "issues", "rationale"}:
-        raise ValueError("review requires exactly accept,issues,rationale")
+    if not isinstance(result, dict) or not {"accept", "issues", "rationale"}.issubset(result):
+        raise ValueError("review requires accept,issues,rationale")
+    result = {key: result[key] for key in ("accept", "issues", "rationale")}
     if type(result["accept"]) is not bool:
         raise ValueError("accept must be boolean")
     if not isinstance(result["issues"], list) or not all(isinstance(x, str) and x.strip() for x in result["issues"]):

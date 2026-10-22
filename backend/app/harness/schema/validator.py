@@ -71,6 +71,7 @@ class ValidationResult:
     errors: list[ValidationError] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     body: str = ""
+    warnings: list[ValidationError] = field(default_factory=list)
 
     def first_error(self) -> str | None:
         return self.errors[0].message if self.errors else None
@@ -162,13 +163,21 @@ def validate_metadata(
 
     validator = Draft202012Validator(schema)
     errors_raw = sorted(validator.iter_errors(metadata), key=lambda e: list(e.path))
-    errors = [
-        ValidationError(path=_format_path(e), message=e.message) for e in errors_raw
-    ]
+    # Presentation metadata is advisory. Typed execution fields and experiment
+    # identities remain strict; this does not coerce YAML numbers or booleans.
+    advisory = {"created", "title", "description", "summary", "upstream_artifact", "experiment_plan_sha256"}
+    errors: list[ValidationError] = []
+    warnings: list[ValidationError] = []
+    for error in errors_raw:
+        item = ValidationError(path=_format_path(error), message=error.message)
+        short_prose = (error.validator == "minLength" and isinstance(error.instance, str)
+                       and bool(error.instance.strip()))
+        (warnings if item.path.split("/")[1] in advisory or short_prose else errors).append(item)
     return ValidationResult(
         schema_id=schema_id,
         valid=not errors,
         errors=errors,
+        warnings=warnings,
         metadata=metadata,
     )
 

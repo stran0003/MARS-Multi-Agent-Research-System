@@ -28,6 +28,7 @@ from app.storage.artifact_store import ArtifactStore
 from app.storage.run_store import RunHandle
 from app.harness.persistence import path_lock
 from app.harness.runtime.project_scope import safe_scope_path
+from app.harness.runtime.research_contract import relative_scope
 from app.harness.schema.validator import validate_document
 
 
@@ -50,7 +51,8 @@ def _generate_report_bundle(run: RunHandle, *, actor: str, formats: tuple[str, .
     validation = validate_document(approved.read_text(encoding="utf-8"), expected_schema="report.v1")
     if not validation.valid or validation.metadata.get("project") != run.project:
         raise ValueError("已审核报告格式或项目身份不正确，未生成导出文件")
-    deliverables_dir = safe_scope_path(run.root, str(Path(str(cfg.get("deliverables_dir", "writing/deliverables"))) / ".export_anchor")).parent / uuid4().hex
+    export_scope = relative_scope(str(cfg.get("deliverables_dir", "writing/deliverables")))
+    deliverables_dir = safe_scope_path(run.root, export_scope + "/.export_anchor").parent / uuid4().hex
     deliverables_dir.mkdir(parents=True, exist_ok=True)
 
     previous = read_latest_report_bundle(run)

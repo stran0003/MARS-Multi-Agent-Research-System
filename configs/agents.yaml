@@ -275,6 +275,8 @@ writing:
       provider: zhipu
       model: glm-5.3
   loop:
+    protocol: native_tools
+    native_observation_history: true
     mode: reflection
     input_token_budget: 128000
     max_validation_repairs: 1

@@ -200,14 +200,14 @@ def _collect_curves(run: RunHandle, source_refs: list[str]) -> list[dict[str, An
             try:
                 candidate = Path(str(evidence["path"]))
                 relative = candidate.relative_to(run.root.resolve()) if candidate.is_absolute() else candidate
-                if not str(relative).startswith("execution/"):
+                if not relative.as_posix().startswith("execution/"):
                     raise ValueError("curve source outside execution")
-                summary = safe_scope_path(run.root, str(relative), must_exist=True)
+                summary = safe_scope_path(run.root, relative.as_posix(), must_exist=True)
                 if summary.name != "summary.json":
                     continue
                 if evidence.get("sha256") != "sha256:" + hashlib.sha256(summary.read_bytes()).hexdigest():
                     raise ValueError("summary digest differs from job receipt")
-                path = safe_scope_path(run.root, str(relative.parent / "steps.jsonl"), must_exist=True)
+                path = safe_scope_path(run.root, (relative.parent / "steps.jsonl").as_posix(), must_exist=True)
                 if path.stat().st_size > 16 * 1024 * 1024:
                     raise ValueError("step file exceeds export limit")
                 points = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]

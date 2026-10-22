@@ -58,7 +58,7 @@ def test_approval_default_saves_portable_markdown_and_images_without_office(tmp_
     assert '](execution/conversion-fixture.png' not in md.read_text(encoding="utf-8")
     package = download_path(run, "report_materials.zip", bundle["manifest"])
     with zipfile.ZipFile(package) as archive:
-        assert archive.read("research_report.md").decode() == md.read_text(encoding="utf-8")
+        assert archive.read("research_report.md") == md.read_bytes()
         assert archive.read(f"images/{saved.name}") == image_bytes
         assert archive.testzip() is None
     plot.write_bytes(b"source changed after saving")
@@ -240,6 +240,6 @@ async def check():
     again = await agent.build_context(request)
     assert again.metadata["skills"] == context.metadata["skills"]
 asyncio.run(check())
-'''.replace("TEST_RUN_ROOT", str(tmp_path / "runs"))
+'''.replace("TEST_RUN_ROOT", (tmp_path / "runs").as_posix())
     result = subprocess.run([sys.executable, "-c", script], env={**os.environ, "MARS_RUNTIME_ROOT": str(root)}, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr

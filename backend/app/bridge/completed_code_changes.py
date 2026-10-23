@@ -15,18 +15,19 @@ from app.bridge.code_changes import _copy_yaml_operations, _read, parse_diff
 from app.bridge.code_repository import CodeRepository, run_code_repository
 from app.settings import repo_root
 from app.storage.run_store import RunHandle
+from app.harness.tools.code.file_snapshot import FileContent, content_bytes, snapshot_content
 
 
 @dataclass
 class FileChange:
-    before: str | None
-    after: str | None
+    before: FileContent
+    after: FileContent
     timestamp: str
     record_id: str
     valid: bool = True
 
 
-def _snapshots(run: RunHandle, record: dict[str, Any], limit: int, *, key: str = 'snapshots') -> dict[str, str | None]:
+def _snapshots(run: RunHandle, record: dict[str, Any], limit: int, *, key: str = 'snapshots') -> dict[str, FileContent]:
     ref = record.get("rollback_ref")
     if not isinstance(ref, str) or not ref:
         raise ValueError("missing write snapshot")
@@ -37,22 +38,21 @@ def _snapshots(run: RunHandle, record: dict[str, Any], limit: int, *, key: str =
     if (data.get("schema") != "tool_rollback.v1" or data.get("run_id") != run.run_id
             or data.get("project") != run.project or data.get("tool") != record["tool"]):
         raise ValueError("snapshot identity mismatch")
-    snapshots: dict[str, str | None] = {}
+    snapshots: dict[str, FileContent] = {}
     for snapshot in data[key]:
         path, content, existed = snapshot["path"], snapshot["content"], snapshot["existed"]
         if not isinstance(path, str) or not isinstance(content, str) or type(existed) is not bool or path in snapshots:
             raise ValueError("invalid snapshot")
-        expected = "sha256:" + hashlib.sha256(content.encode()).hexdigest() if existed else ""
-        if snapshot["sha256"] != expected:
-            raise ValueError("snapshot hash mismatch")
-        snapshots[path] = content if existed else None
+        snapshots[path] = snapshot_content(snapshot)
     return snapshots
 
 
-def _patched(before: str | None, item: dict[str, Any]) -> str | None:
+def _patched(before: FileContent, item: dict[str, Any]) -> str | None:
     """Replay archived text hunks without executing a command or changing files."""
     if item.get("warning") or item["change"] == "renamed":
         raise ValueError("patch cannot be reconstructed")
+    if isinstance(before, bytes):
+        raise ValueError('Binary patches require an archived postimage')
     original = (before or "").splitlines(keepends=True)
     result: list[str] = []
     cursor = 0
@@ -107,7 +107,7 @@ def _patched(before: str | None, item: dict[str, Any]) -> str | None:
     return after
 
 
-def _operations(run: RunHandle, record: dict[str, Any], limit: int) -> list[tuple[str, str | None, str | None]]:
+def _operations(run: RunHandle, record: dict[str, Any], limit: int) -> list[tuple[str, FileContent, FileContent]]:
     if record['tool'] == 'code.copy_yaml':
         return [(path, before, after) for path, before, after in _copy_yaml_operations(run, record, limit)]
     snapshots = _snapshots(run, record, limit)
@@ -138,7 +138,12 @@ def _operations(run: RunHandle, record: dict[str, Any], limit: int) -> list[tupl
     return [(item["path"], snapshots[item["path"]], _patched(snapshots[item["path"]], item)) for item in files]
 
 
-def _net_diff(path: str, before: str | None, after: str | None, context: int) -> dict[str, Any]:
+def _net_diff(path: str, before: FileContent, after: FileContent, context: int) -> dict[str, Any]:
+    if isinstance(before, bytes) or isinstance(after, bytes):
+        return {'path': path, 'change': 'added' if before is None else 'deleted' if after is None else 'modified',
+                'binary': True, 'additions': 0, 'deletions': 0,
+                'lines': [{'kind': 'meta', 'text': '二进制文件变更，已保留精确恢复快照。',
+                           'old_line': None, 'new_line': None}]}
     parts = difflib.unified_diff((before or "").splitlines(keepends=True), (after or "").splitlines(keepends=True),
         fromfile="/dev/null" if before is None else "a/" + path,
         tofile="/dev/null" if after is None else "b/" + path, n=context)
@@ -260,16 +265,19 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
                 if change.after is not None:
                     raise
             else:
-                if change.after is None or current["version"] != hashlib.sha256(change.after.encode()).hexdigest():
+                if change.after is None or current["version"] != hashlib.sha256(content_bytes(change.after)).hexdigest():
                     raise ValueError("current file differs from the completed write")
             if change.before == change.after:
-                unchanged.append({"path": path, "sha256": hashlib.sha256(change.after.encode()).hexdigest()
+                unchanged.append({"path": path, "sha256": hashlib.sha256(content_bytes(change.after)).hexdigest()
                                   if change.after is not None else None,
                                   "exists": change.after is not None})
                 continue
             item = _net_diff(path, change.before, change.after, policy["context_lines"])
             lines = item.pop("lines")
-            fingerprint = hashlib.sha256(json.dumps([path, change.before, change.after, change.record_id]).encode()).hexdigest()
+            def fingerprint_value(value: FileContent) -> Any:
+                return {'binary_sha256': hashlib.sha256(value).hexdigest()} if isinstance(value, bytes) else value
+            fingerprint = hashlib.sha256(json.dumps([path, fingerprint_value(change.before),
+                fingerprint_value(change.after), change.record_id]).encode()).hexdigest()
             item.update(id="completed:" + fingerprint, status="applied", source="verified_tool_writes",
                         timestamp=change.timestamp, truncated=len(lines) > policy["max_preview_lines"])
             if change_id == item["id"]:

@@ -159,7 +159,14 @@ def branch_owner(root: Path) -> tuple[GitBranch, Path] | None:
 
 def changed_files(root: Path, base: str = "HEAD") -> set[str]:
     changed = set(filter(None, git(root, "--no-optional-locks", "diff", "--name-only", "--no-renames", "-z", base).split("\0")))
-    changed.update(filter(None, git(root, "--no-optional-locks", "ls-files", "--others", "--exclude-standard", "-z").split("\0")))
+    from app.harness.project_storage import storage_policy
+    patterns = storage_policy().get('runtime_cache_excludes', [])
+    if not isinstance(patterns, list) or any(not isinstance(pattern, str) for pattern in patterns):
+        raise ValueError('Invalid runtime cache exclusion policy')
+    # Git exclusions apply only to untracked caches. A tracked source/cache
+    # change still appears in diff, and ordinary unrecorded code still blocks.
+    excludes = tuple('--exclude=' + pattern for pattern in patterns)
+    changed.update(filter(None, git(root, "--no-optional-locks", "ls-files", "--others", "--exclude-standard", *excludes, "-z").split("\0")))
     return changed
 
 

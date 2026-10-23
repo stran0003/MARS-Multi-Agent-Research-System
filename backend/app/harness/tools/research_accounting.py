@@ -110,9 +110,9 @@ def _rollback(scope: ProjectScope, value: str) -> tuple[str, list[dict[str, Any]
         if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
                 or type(item.get("existed")) is not bool or not isinstance(item.get("content"), str)):
             raise ValueError("rollback snapshot is invalid")
-        content_hash = "sha256:" + hashlib.sha256(item["content"].encode()).hexdigest()
-        if item["existed"] and item.get("sha256") != content_hash:
-            raise ValueError("rollback content hash differs")
+        from app.harness.tools.code.file_snapshot import snapshot_content
+        snapshot_content(item)  # Verify actual text/binary bytes using the shared snapshot format.
+        content_hash = item['sha256']
         scope.resolve_file(item["path"], write=True)
         snapshots.append({"path": item["path"], "existed": item["existed"],
                           "content_sha256": content_hash if item["existed"] else None})

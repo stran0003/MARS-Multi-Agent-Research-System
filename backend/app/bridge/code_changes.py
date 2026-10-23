@@ -114,7 +114,7 @@ def _read(path: Path, root: Path, limit: int) -> str:
     return raw.decode('utf-8')
 
 
-def _before(run: RunHandle, record: dict[str, Any], path: str, limit: int) -> str | None:
+def _before(run: RunHandle, record: dict[str, Any], path: str, limit: int) -> str | bytes | None:
     ref = record.get('rollback_ref')
     if not isinstance(ref, str) or not ref:
         return None
@@ -127,13 +127,8 @@ def _before(run: RunHandle, record: dict[str, Any], path: str, limit: int) -> st
         raise ValueError('rollback identity mismatch')
     for snapshot in data['snapshots']:
         if snapshot['path'] == path:
-            content = snapshot['content']
-            if not isinstance(content, str):
-                raise ValueError('invalid snapshot')
-            expected = 'sha256:' + hashlib.sha256(content.encode()).hexdigest() if snapshot['existed'] else ''
-            if snapshot['sha256'] != expected:
-                raise ValueError('snapshot hash mismatch')
-            return content
+            from app.harness.tools.code.file_snapshot import snapshot_content
+            return snapshot_content(snapshot)
     return None
 
 
@@ -233,13 +228,20 @@ def code_changes(run: RunHandle, *, project: str, change_id: str | None = None) 
                     after = '' if tool == 'code.delete_file' else args.get('content')
                     if not isinstance(after, str):
                         continue
-                    before = _before(run, record, path, limit)
-                    if before is None:
+                    previous_content = _before(run, record, path, limit)
+                    if isinstance(previous_content, bytes):
+                        files = [{'path': path, 'additions': 0, 'deletions': 0, 'binary': True,
+                                  'change': 'deleted' if tool == 'code.delete_file' else 'modified',
+                                  'lines': [{'kind': 'meta', 'text': '二进制文件变更，已保留恢复快照。',
+                                             'old_line': None, 'new_line': None}]}]
+                        if status == 'recorded':
+                            status = 'applied'
+                    elif previous_content is None:
                         files = [{'path': path, 'additions': None, 'deletions': None, 'change': 'content',
                                   'lines': [{'kind': 'preview', 'text': line, 'old_line': None, 'new_line': i + 1}
                                             for i, line in enumerate(after.splitlines())]}]
                     else:
-                        diff = '\n'.join(difflib.unified_diff(before.splitlines(), after.splitlines(),
+                        diff = '\n'.join(difflib.unified_diff(previous_content.splitlines(), after.splitlines(),
                             fromfile='a/' + path, tofile='b/' + path, n=policy['context_lines'], lineterm=''))
                         files = parse_diff(diff) if diff else [{'path': path, 'additions': 0, 'deletions': 0, 'change': 'unchanged', 'lines': []}]
                         if status == 'recorded':

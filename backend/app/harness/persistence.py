@@ -64,6 +64,24 @@ def atomic_write_text(path: Path, text: str, *, newline: str | None = "") -> Non
         temporary.unlink(missing_ok=True)
 
 
+def atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Publish a complete binary snapshot using the same Windows-safe replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, name = tempfile.mkstemp(prefix=f'.{path.name}.', suffix='.tmp', dir=path.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if os.name != 'nt' and path.exists():
+            os.chmod(temporary, path.stat().st_mode & 0o777)
+        replace_complete_file(temporary, path)
+        fsync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def replace_complete_file(temporary: Path | str, path: Path | str, *, timeout: float = 5.0) -> None:
     """Allow a Windows reader to close its handle before atomic replacement.
 

@@ -9,7 +9,7 @@ import json
 import re
 import time
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,12 +17,13 @@ from typing import Any
 import yaml
 
 from app.harness.project_workspace import project_root
-from app.harness.persistence import atomic_write_text
+from app.harness.persistence import atomic_write_text, atomic_write_bytes
 from app.harness.runtime.git_runtime import GitRuntimeError, git_environment, resolve_git
 from app.harness.runtime.project_scope import current_project_scope, validated_diff_paths
 from app.harness.tools.config import check_commands, command_timeout_seconds, tool_config
 from app.harness.tools.registry import ToolContext, ToolResult
 from app.harness.tools.code.patch_text import normalize_patch
+from app.harness.tools.code.file_snapshot import FileSnapshot, FileContent, snapshot_content
 from app.harness.tools.process_runtime import communicate_process, start_process
 from app.settings import repo_root
 
@@ -45,14 +46,6 @@ _TEXT_SUFFIXES = {
     ".yaml",
     ".yml",
 }
-
-
-@dataclass(frozen=True)
-class FileSnapshot:
-    path: str
-    existed: bool
-    sha256: str
-    content: str
 
 
 async def repo_reader_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
@@ -291,7 +284,11 @@ async def apply_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult
         for snapshot in snapshots:
             target = root / snapshot.path
             if snapshot.existed:
-                atomic_write_text(target, snapshot.content)
+                original = snapshot_content(asdict(snapshot))
+                if isinstance(original, bytes):
+                    atomic_write_bytes(target, original)
+                else:
+                    atomic_write_text(target, snapshot.content)
             else:
                 target.unlink(missing_ok=True)
         return ToolResult(ok=False, error=str(exc))
@@ -353,7 +350,7 @@ async def rollback_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolRes
     root = _project_root(ctx)
     if root is None:
         return ToolResult(ok=False, error=f"project repo for '{ctx.project}' is not connected")
-    targets: list[tuple[dict[str, Any], str, Path]] = []
+    targets: list[tuple[FileContent, str, Path]] = []
     for item in raw_snapshots:
         if not isinstance(item, dict):
             continue
@@ -361,14 +358,19 @@ async def rollback_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolRes
         resolved = _resolve_project_file(ctx, rel, must_exist=False, for_write=True)
         if isinstance(resolved, ToolResult):
             return resolved
-        targets.append((item, rel, resolved[2]))
+        try:
+            targets.append((snapshot_content(item), rel, resolved[2]))
+        except ValueError as exc:
+            return ToolResult(ok=False, error=str(exc))
     restored: list[str] = []
-    for item, rel, target in targets:
-        existed = bool(item.get("existed", False))
-        if existed:
+    for content, rel, target in targets:
+        if content is not None:
             target.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(target, str(item.get("content", "")),
-                newline='' if data.get('text_mode') == 'utf8_exact' else None)
+            if isinstance(content, bytes):
+                atomic_write_bytes(target, content)
+            else:
+                atomic_write_text(target, content,
+                    newline='' if data.get('text_mode') == 'utf8_exact' else None)
         elif target.exists():
             target.unlink()
         restored.append(rel)
@@ -679,8 +681,7 @@ def _is_ignored_path(project: str, rel: str) -> bool:
 def _snapshot(rel: str, target: Path) -> FileSnapshot:
     if not target.exists():
         return FileSnapshot(path=rel, existed=False, sha256="", content="")
-    text = target.read_bytes().decode('utf-8')
-    return FileSnapshot(path=rel, existed=True, sha256=_sha_text(text), content=text)
+    return FileSnapshot.capture(rel, target.read_bytes())
 
 
 def _record_branch_write(ctx: ToolContext, files: list[str]) -> None:
@@ -768,23 +769,25 @@ def _bound_rollback(ctx: ToolContext, rollback_ref: str) -> ToolResult:
                 or data.get("run_id") != ctx.run_id or data.get("project") != ctx.project
                 or not isinstance(data.get("snapshots"), list) or not data["snapshots"]):
             raise ValueError("Rollback identity or snapshot is invalid")
-        validated: list[tuple[str, Path, bool, str]] = []
+        validated: list[tuple[str, Path, FileContent]] = []
         for item in data["snapshots"]:
             if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
                     or type(item.get("existed")) is not bool or not isinstance(item.get("content"), str)):
                 raise ValueError("Rollback snapshot is malformed")
-            if item["existed"] and _sha_text(item["content"]) != item.get("sha256"):
-                raise ValueError("Rollback content fingerprint differs")
+            content = snapshot_content(item)
             target = scope.resolve_file(item["path"], write=True)
-            validated.append((item["path"], target, item["existed"], item["content"]))
+            validated.append((item["path"], target, content))
         # Validate every target before writing any; a protected final entry must
         # not partially apply earlier permitted entries.
         if not ctx.dry_run:
-            for _name, target, existed, content in validated:
-                if existed:
+            for _name, target, content in validated:
+                if content is not None:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    atomic_write_text(target, content,
-                        newline='' if data.get('text_mode') == 'utf8_exact' else None)
+                    if isinstance(content, bytes):
+                        atomic_write_bytes(target, content)
+                    else:
+                        atomic_write_text(target, content,
+                            newline='' if data.get('text_mode') == 'utf8_exact' else None)
                 elif target.exists():
                     target.unlink()
         return ToolResult(ok=True, output={"rolled_back": [item[0] for item in validated], "dry_run": ctx.dry_run})

@@ -4,6 +4,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Iterator
 
@@ -26,6 +28,7 @@ from app.harness.tools.execution.local_command import LocalCommandJob, _command,
 from app.harness.tools.execution.command_preflight import run_command_preflight
 from app.harness.tools.execution.prepared_command import prepare_execution_tool, prepared_commands
 from app.harness.tools.git_branch import git
+from app.harness.tools.git_branch import changed_files, GitWorkspaceError
 from app.harness.tools.project_repo import load_project_repo
 from app.harness.tools.registry import ToolContext, get_registry
 from app.storage.run_store import RunHandle
@@ -180,3 +183,54 @@ async def test_native_path_error_is_actual_tool_feedback_and_loop_stays_running(
             'input': {'file_path': str(root / 'main.py'), 'old_string': '1', 'new_string': '2'}})
         assert permission['decision'] == 'allow'
         await request.provider.close()
+
+
+@pytest.mark.asyncio
+async def test_binary_cleanup_is_reviewable_and_restores_exact_png(tmp_path: Path) -> None:
+    from PIL import Image
+    from app.bridge.completed_code_changes import completed_code_changes
+    from app.bridge.code_changes import code_changes
+    with checkout(tmp_path) as (ctx, root, source):
+        target = root / 'rank_space.png'
+        Image.new('RGB', (16, 16), (10, 80, 120)).save(target)
+        original = target.read_bytes()
+        removed = await get_registry().dispatch('code.delete_file', {'path': target.name}, ctx)
+        assert removed.ok and removed.rollback_ref and not target.exists(), removed.error
+        run = RunHandle(ctx.run_id, Path(ctx.extra['run_root']), ctx.project, 'binary cleanup', 'coding', '2026-10-23T00:00:00Z')
+        for read_changes in (completed_code_changes, code_changes):
+            view = read_changes(run, project=ctx.project)
+            assert not view['warnings'] and view['items'][0]['binary']
+            assert view['items'][0]['change'] == 'deleted'
+        restored = await get_registry().dispatch('code.rollback_patch', {'rollback_ref': removed.rollback_ref}, ctx)
+        assert restored.ok and target.read_bytes() == original, restored.error
+
+
+@pytest.mark.asyncio
+async def test_real_python_cache_does_not_block_approved_code_but_unknown_source_does(tmp_path: Path) -> None:
+    from app.bridge.research_branch import checkpoint_approved_code
+    from app.harness.schema.frontmatter_parser import dumps
+    with checkout(tmp_path) as (ctx, root, source):
+        assert (await get_registry().dispatch('code.write_file', {'path': 'main.py', 'content': 'VALUE = 7\n'}, ctx)).ok
+        subprocess.run([sys.executable, '-m', 'compileall', '-q', str(root)], check=True)
+        assert list(root.glob('__pycache__/*.pyc'))
+        assert changed_files(root) == {'main.py'}
+        run = RunHandle(ctx.run_id, Path(ctx.extra['run_root']), ctx.project, 'cache gate', 'coding', '2026-10-23T00:00:00Z')
+        (run.root / 'coding').mkdir(exist_ok=True)
+        (run.root / 'coding/code_spec.approved.md').write_text(dumps({
+            'schema': 'code_spec.v1', 'project': ctx.project, 'agent': 'coding', 'target_lang': 'python',
+            'baseline_compat': {'preserved': True}, 'new_dependencies': [],
+            'test_coverage': {'unit_tests_added': 0, 'baseline_smoke_test': 'skipped'},
+            'files_changed': [{'path': 'main.py', 'type': 'modified', 'risk': 'low'}]}, 'Actual local code approval for this boundary test.'), encoding='utf-8')
+        checkpoint_approved_code(run)
+        assert not changed_files(root)
+        assert (source / 'main.py').read_text() == 'VALUE = 1\nTAIL = 2\n'
+        (root / 'unreviewed.py').write_text('VALUE = 99\n')
+        with pytest.raises(GitWorkspaceError, match='未纳入'):
+            checkpoint_approved_code(run)
+        # Exclusions never conceal tracked cache changes.
+        cache = next(root.glob('__pycache__/*.pyc'))
+        git(root, 'add', '-f', '--', cache.relative_to(root).as_posix())
+        git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost',
+            '-c', 'commit.gpgsign=false', 'commit', '-m', 'Tracked cache for actual Git boundary test')
+        cache.write_bytes(b'changed tracked cache')
+        assert cache.relative_to(root).as_posix() in changed_files(root)

@@ -2,7 +2,7 @@ project_storage:
   checkpoint_keys: [init_checkpoint, pretrained_checkpoint]
   checkpoint_suffixes: [.pth, .pt, .ckpt]
   max_checkpoint_bytes: 1073741824
-  runtime_cache_excludes: [__pycache__/, '*.py[cod]', .pytest_cache/, .mypy_cache/, .ruff_cache/]
+  runtime_cache_excludes: [__pycache__/, '*.pyc', '*.pyo', .pytest_cache/, .mypy_cache/, .ruff_cache/]
   directories:
     context: context
     code: code

@@ -227,6 +227,8 @@ async def test_real_python_cache_does_not_block_approved_code_but_unknown_source
         (root / 'unreviewed.py').write_text('VALUE = 99\n')
         with pytest.raises(GitWorkspaceError, match='未纳入'):
             checkpoint_approved_code(run)
+        (root / 'extension.pyd').write_bytes(b'unreviewed native extension file')
+        assert 'extension.pyd' in changed_files(root)  # A Windows extension is not Python bytecode cache.
         # Exclusions never conceal tracked cache changes.
         cache = next(root.glob('__pycache__/*.pyc'))
         git(root, 'add', '-f', '--', cache.relative_to(root).as_posix())
@@ -234,3 +236,41 @@ async def test_real_python_cache_does_not_block_approved_code_but_unknown_source
             '-c', 'commit.gpgsign=false', 'commit', '-m', 'Tracked cache for actual Git boundary test')
         cache.write_bytes(b'changed tracked cache')
         assert cache.relative_to(root).as_posix() in changed_files(root)
+
+
+@pytest.mark.asyncio
+async def test_task_local_entry_survives_unbound_approval_and_execution_preview(tmp_path: Path) -> None:
+    from app.bridge.execution_confirmation import execution_preview
+    from app.harness.schema.frontmatter_parser import dumps
+    from app.harness.tools.git_branch import current_git_branch
+    from app.storage.artifact_store import ArtifactStore
+    with environment({'MARS_FOLDER_PROJECTS_REGISTRY': str(tmp_path / 'registry.json'),
+                      'MARS_EXECUTION_CONFIG_PATH': str(tmp_path / 'execution.yaml'),
+                      'MARS_EXECUTION_BACKEND': 'local_command'}):
+        with checkout(tmp_path) as (ctx, root, source):
+            assert (await get_registry().dispatch('code.write_file', {'path': 'job.py',
+                'content': 'raise RuntimeError("This boundary test does not launch training")\n'}, ctx)).ok
+            prepared = await get_registry().dispatch('code.prepare_execution', {
+                'entrypoint': 'job.py', 'config_path': 'config.yaml'}, ctx)
+            assert prepared.ok, prepared.error
+            config = {key: prepared.output[key] for key in ('command_id', 'entrypoint', 'config_path')}
+            config.update(seed=42, budget_steps=1)
+            run = RunHandle(ctx.run_id, Path(ctx.extra['run_root']), ctx.project,
+                'unbound preview', 'coding', '2026-10-23T00:00:00Z')
+        # HTTP preview/reload does not inherit the Coding coroutine's ContextVar.
+        assert current_git_branch(run.project) is None
+        store = ArtifactStore(run)
+        store.approve(store.write(text=dumps({'schema': 'code_spec.v1', 'project': run.project,
+            'agent': 'coding', 'target_lang': 'python', 'baseline_compat': {'preserved': True},
+            'files_changed': [{'path': 'job.py', 'type': 'added', 'risk': 'low'}], 'new_dependencies': [],
+            'test_coverage': {'unit_tests_added': 0, 'baseline_smoke_test': 'skipped'},
+            'execution_jobs': [{'name': 'actual_job', 'config': config}]}, 'Human-authored launch declaration for this boundary test.')))
+        store.approve(store.write(text=dumps({'schema': 'run_log.v1', 'project': run.project,
+            'agent': 'execution', 'run_id': run.run_id, 'status': 'interrupted',
+            'metrics': {'planned_experiments': 1}, 'fingerprint_hash': 'sha256:00',
+            'planned_experiments': [{'name': 'actual_job', 'config': config}]}, 'Executable intake only; no run or measured success is asserted.')))
+        preview = execution_preview(run, 'execution')
+        assert not preview['blockers'], preview['blockers']
+        assert preview['experiments'][0]['effective']['command_id'] == prepared.output['command_id']
+        assert preview['experiments'][0]['effective']['validation_configured']
+        assert not (run.root / 'execution/local_commands').exists()

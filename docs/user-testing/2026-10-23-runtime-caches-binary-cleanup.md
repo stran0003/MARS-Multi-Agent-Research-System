@@ -14,3 +14,11 @@ Validation:
 - Type checking passed for all seven modified source modules.
 - Using the actual user's saved checkout and approved code artifact, `research_branch_scope(..., 'execution')` passed after the fix with no unreviewed source changes. This check did not start training or fabricate an execution receipt.
 - Local regression report: `runs/cache-binary-regression.xml` (not committed).
+
+## Task-local launch handoff
+
+Once the cache blocker was removed, configuration preview exposed another host defect: `coding_handoff_errors` inferred its task directory only from the active Coding coroutine's ContextVar. HTTP preview/background preparation runs outside that coroutine, so lookup fell back to the MARS process working directory and incorrectly reported the saved `prepared_cacc1b0b4ec5c3d42d3d` command as unavailable.
+
+Every run-aware caller now supplies `run_id` and `run_root` explicitly: artifact approval, Coding candidate admission, execution planning/preview, dispatch handoff checks and no-training preflight. Task-local commands without a usable task context produce a specific host-context error instead of guessing a working directory. Existing globally configured commands retain compatibility.
+
+The regression creates a real isolated code checkout and prepared command, exits the Coding context, then approves the human-authored launch documents and reads execution preview with no bound ContextVar. The actual command is found, and no process is launched by this read-only boundary check. The actual 160M task's unbound preview was also verified with no blockers and the correct saved command ID.

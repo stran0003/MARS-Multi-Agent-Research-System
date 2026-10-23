@@ -49,7 +49,8 @@ def execution_delivery_context(*, project: str | None = None) -> dict[str, Any]:
     }
 
 def coding_handoff_errors(plan_text: str, coding: dict[str, Any], *, project: str,
-                          plan_required: bool = False) -> list[str]:
+                          plan_required: bool = False, run_id: str = '',
+                          run_root: Path | None = None) -> list[str]:
     try:
         jobs = delivery_experiments(plan_text, coding, project=project, plan_required=plan_required)
     except ValueError as exc:
@@ -107,12 +108,15 @@ def coding_handoff_errors(plan_text: str, coding: dict[str, Any], *, project: st
                                      + (', '.join(ids) if ids else '无；由 Coding 创建适配器并调用 code.prepare_execution'))
                 from app.harness.tools.git_branch import current_git_branch, branch_owner
                 from app.harness.runtime.project_scope import current_project_scope
-                branch = current_git_branch(project)
-                scope = current_project_scope(project)
-                run_id = branch.run_id if branch is not None else scope.run_id if scope is not None else 'handoff-check'
+                branch = current_git_branch(project, run_id or None)
+                scope = current_project_scope(project, run_id or None)
+                bound_run_id = run_id or (branch.run_id if branch is not None else scope.run_id if scope is not None else 'handoff-check')
                 owner = branch_owner(branch.root) if branch is not None else None
-                _command(LocalCommandJob(run_id=run_id, experiment_id=job['name'],
-                    project=project, run_root=scope.run_root if scope is not None else owner[1] if owner else Path('.'),
+                bound_run_root = run_root or (scope.run_root if scope is not None else owner[1] if owner else Path('.'))
+                if command_id.startswith('prepared_') and bound_run_root == Path('.'):
+                    raise ValueError('任务内启动命令核验需要当前任务的 run_id 和 run_root，不能使用进程工作目录')
+                _command(LocalCommandJob(run_id=bound_run_id, experiment_id=job['name'],
+                    project=project, run_root=bound_run_root,
                     command_id=command_id, config=config), 'execution.simulation_runner')
         except (OSError, ValueError, RuntimeError) as exc:
             errors.append(prefix + ': ' + str(exc))
@@ -127,7 +131,8 @@ async def coding_handoff_preflight_errors(plan_text: str, coding: dict[str, Any]
     This is not artifact approval, execution confirmation or a training
     receipt. No source configuration or scientific default is rewritten.
     """
-    errors = coding_handoff_errors(plan_text, coding, project=project, plan_required=plan_required)
+    errors = coding_handoff_errors(plan_text, coding, project=project, plan_required=plan_required,
+                                  run_id=run_id, run_root=run_root)
     if errors or get_settings().mars_execution_backend != 'local_command':
         return errors
     from app.harness.persistence import atomic_write_json

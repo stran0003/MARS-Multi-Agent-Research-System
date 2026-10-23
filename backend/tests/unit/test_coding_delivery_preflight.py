@@ -283,7 +283,9 @@ async def test_cancellation_waits_for_registered_timeout_and_leaves_no_checker_p
     with bind_git_branch(delivery.branch):
         task = asyncio.create_task(coding_handoff_preflight_errors('', delivery.metadata(), project=delivery.project,
             run_id='delivery', run_root=delivery.run_root))
-        deadline = time.monotonic() + 5
+        # Checkout/receipt verification and Windows process startup precede the
+        # registered two-second checker runtime. Keep these budgets separate.
+        deadline = time.monotonic() + 30
         calls = delivery.root / 'checker_calls.jsonl'
         while not calls.exists():
             assert time.monotonic() < deadline, 'Actual checker did not start'
@@ -297,8 +299,27 @@ async def test_cancellation_waits_for_registered_timeout_and_leaves_no_checker_p
             await asyncio.wait_for(task, timeout=4)
         assert time.monotonic() - started < 4
     pid = json.loads(calls.read_text().splitlines()[0])['pid']
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    if os.name == 'nt':
+        # Windows os.kill(pid, 0) calls TerminateProcess and is not a POSIX
+        # existence probe. Query the real process handle without signaling it.
+        import ctypes
+        from ctypes import wintypes
+        kernel = getattr(ctypes, 'WinDLL')('kernel32', use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+        if handle:
+            try:
+                assert kernel.WaitForSingleObject(handle, 0) == 0, 'Checker process is still alive'
+            finally:
+                kernel.CloseHandle(handle)
+        else:
+            assert ctypes.get_last_error() == 87, 'Could not verify checker process exit'
+    else:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
     receipts = list((delivery.run_root / 'execution/preflight').glob('*/validation_receipt.json'))
     assert len(receipts) == 1
     receipt = json.loads(receipts[0].read_text())

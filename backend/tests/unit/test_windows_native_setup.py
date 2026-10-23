@@ -96,7 +96,7 @@ def test_windows_probe_keeps_required_glm_thinking_and_bounded_output() -> None:
     selected = probe.probe_config(original)
     assert selected.thinking_enabled is True and selected.reasoning_effort == "low"
     assert selected.max_tokens == 2048 and selected.max_retries == 0
-    assert selected.request_timeout_seconds == 45
+    assert selected.request_timeout_seconds == 720
     assert original.thinking_enabled is False and original.max_tokens == 32
     custom = probe.probe_config(LLMConfig(provider="custom", model="other-model", thinking_enabled=True))
     assert custom.thinking_enabled is False and custom.reasoning_effort is None

@@ -1,6 +1,6 @@
 # MARS - Multi-Agent Research System
 
-**Windows 原生 CPU 一键运行：** 双击根目录 `MARS-Windows.cmd`，首次自动安装依赖并引导配置本机 API，然后启动前后端。详见 [Windows 原生使用说明](deploy/windows-native/README.md)。
+**Windows 原生 CPU 一键运行：** 双击根目录 `MARS-Windows.cmd`，首次自动安装依赖和 ZCode，启动前后端后在设置中配置本机 API。详见 [Windows 原生使用说明](deploy/windows-native/README.md)。
 
 ![version](https://img.shields.io/badge/release-Mars_V2.0-coral)
 ![python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -131,21 +131,19 @@ Research agents require configured real model credentials. Missing credentials,
 data, or execution dependencies fail explicitly. Local static PIMC experiments
 can use CPU; see the [CLI instructions](docs/cli-research.md).
 
-### Windows one-click (V3.1 CPU)
+### Windows one-click (native CPU)
 
-On Windows 10/11 x64, install Docker Desktop with WSL2/Linux containers, place
-`mars_v2` and the private `mars_v31_wireless` overlay beside each other, then
-double-click `start-mars-windows.cmd`. It builds the CPU image, checks both
-services and run readiness, and opens `http://127.0.0.1:3001/`. The online,
-offline, strict production (including offline), status, and stop paths are documented in
-[`deploy/windows/README.md`](deploy/windows/README.md).
+On Windows 10/11 x64, clone this repository or extract the complete source ZIP,
+then double-click **`MARS-Windows.cmd`**. The first launch installs isolated
+Python, Node.js, Git, backend/frontend dependencies and the ZCode app-server,
+verifies them, and opens **http://127.0.0.1:3001/**. Configure your real model API
+in Settings before starting research. Docker, WSL and a private overlay are not
+required. Subsequent launches reuse the installed dependencies.
 
-Script checks and Linux-container tests do not establish Windows-host acceptance.
-Validate deployment on the target Windows host.
-
-Native Windows Python and Windows containers are intentionally unsupported;
-the one-click package keeps Unix permissions, processes, and research
-workspaces inside Linux containers.
+Use `install-mars-windows.cmd` to install/repair only and
+`stop-mars-windows-native.cmd` to stop this copy's services. See the
+[Windows native instructions](deploy/windows-native/README.md). The older
+`start-mars-windows.cmd` remains a separate [Docker deployment](deploy/windows/README.md).
 
 ### Local Python
 

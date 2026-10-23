@@ -9,7 +9,7 @@
 
 1. 把完整代码包解压到 Windows；不要在压缩包预览窗口里直接运行。
 2. 双击根目录 **`MARS-Windows.cmd`**，首次自动安装全部依赖。
-3. 按向导填写 API 地址、模型名称和 Key。Key 输入不显示。
+3. 首次安装需要联网；启动后在 **设置 → Agent 配置** 填写 API 地址、模型名称和 Key。
 4. 安装与健康检查完成后，自动打开 **http://127.0.0.1:3001/**。
 
 之后仍双击 `MARS-Windows.cmd`，即可启动。启动完成后可以关闭启动窗口，
@@ -33,6 +33,7 @@
 - Python 3.11.14、uv、Node.js 22.23.2、npm、MinGit。
 - 后端依赖和开发检查工具：按照 `uv.lock` 导出的版本安装。
 - PIMC CPU 依赖：PyTorch CPU、SciPy、Matplotlib，以及 TensorBoard。
+- ZCode app-server：自动安装锁定的官方 JavaScript 组件，使用本项目的 Windows Node，执行真实协议握手；不调用模型、不另装桌面程序或 WSL。
 - 前端：按照 `frontend/package-lock.json` 安装，随后执行类型检查。
 - 缺少 Microsoft C++ 运行库时，从微软下载并检查数字签名后安装；Windows 可能要求管理员确认。
 
@@ -40,7 +41,7 @@
 `dependencies/frontend/node_modules/`，核心目录中的 `frontend/node_modules` 通过目录联接使用它。
 旧安装的 `local/windows/` 运行环境仍可识别。不会复用拷贝过来的 Mac `.venv`，
 不会修改全局 Python/Node 或系统 PATH。初次安装需要访问 GitHub、nodejs.org、
-PyPI、npm、download.pytorch.org；不是离线安装包。重装会重建这个专用虚拟环境。
+PyPI、npm、download.pytorch.org、cdn-zcode.z.ai；不是离线安装包。重装会重建这个专用虚拟环境；日常启动不会重新安装全部 Python 依赖，缺失的 ZCode 可单独自动修复。
 
 启动时将 Python 指向 Windows 虚拟环境，同时统一前后端地址、Socket.IO 和 CORS。
 单机使用一个后端进程，事件总线可使用内置进程内实现，无需另装 Redis 服务。
@@ -97,7 +98,7 @@ Key 只写入 Git 忽略的根目录 `.env.local`，脚本会限制该文件的 
 配置后可用 `manage-mars-windows.cmd` 的 **6 Test API** 发出作者/评审者各一次小型真实请求。
 这会使用所配置账号的少量额度。HTTP 402 通常是余额/计费问题，401 是 Key 问题；
 脚本会显示脱敏错误码，不会把服务启动或模型列表查询当成完成了研究任务。
-检查保留 GLM 所需 thinking，每次最多 2048 输出 token、45 秒、无自动重试；上限在
+检查保留 GLM 所需 thinking，每次最多 2048 输出 token、720 秒、无自动重试；上限在
 `configs/windows_native.yaml` 配置。该向导仍是源码安装辅助入口，`.env.local` 不是正式桌面产品的平台凭据存储。
 
 前端 API 配置页：**http://127.0.0.1:3001/config/agents**。
@@ -125,6 +126,7 @@ Execution 开始后，已有 TensorBoard 集成会展示该次实际实验过程
   若公司禁止脚本，请让管理员按公司流程放行，不需要设置 `Bypass` 或 `Unrestricted`。
 - **下载失败**：检查上述官方源的网络可达性；重新运行安装可复用已完成且校验通过的压缩包。
   日志中缺少某个轮子时会明确失败，不会假装安装成功。安装窗口会停留供查看错误。
+- **从 PowerShell 7 或编辑器启动**：CMD 入口会为子进程重建 Windows PowerShell 自己的模块搜索路径，避免误加载 PowerShell 7 的模块而找不到 `Get-FileHash` 等命令；不会修改系统环境变量。
 - **端口占用**：停止占用程序，或修改 `configs/windows_native.yaml` 的两项端口再启动。
   脚本不会根据端口随意结束其他程序。
 - **前后端启动失败**：查看 `local/windows/logs/` 下对应启动时间的日志。
@@ -139,5 +141,5 @@ Execution 开始后，已有 TensorBoard 集成会展示该次实际实验过程
 依赖完整性，并实际启动/关闭后端；没有替身模型或模拟服务成功。
 
 另附 `.github/workflows/windows-native.yml`，用于 Windows 实机 CI 的安装、启动、代理和停止验证。
-当前在 macOS 完成的脚本与后端检查不等于 Windows 实机验收；首次 Windows 启动仍以目标电脑
-的实际安装日志和健康结果为准。模型完整任务、真实数据实验与科学结论需要另行验收。
+本地验证使用 Windows 实机的干净 Git 下载副本，独立安装依赖并检查启动、代理、重启与停止。
+其他电脑首次启动仍以其实际安装日志和健康结果为准。模型完整任务、真实数据实验与科学结论需要另行验收。

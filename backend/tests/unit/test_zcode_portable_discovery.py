@@ -73,4 +73,7 @@ def test_explicit_and_path_commands_keep_priority_over_portable_files(tmp_path: 
     selected = directory / name
     shutil.copyfile(sys.executable, selected)
     selected.chmod(0o755)
-    assert _discover(tmp_path, source, path=str(directory)) == (str(selected),)
+    discovered = _discover(tmp_path, source, path=str(directory))
+    assert len(discovered) == 1
+    # Windows PATH/PATHEXT resolution can return .EXE for a file named .exe.
+    assert Path(discovered[0]).samefile(selected)

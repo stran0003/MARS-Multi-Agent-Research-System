@@ -1,5 +1,7 @@
 @echo off
 setlocal
+rem Let Windows PowerShell use its own modules when launched from PowerShell 7.
+set "PSModulePath="
 cd /d "%~dp0"
 if "%~1"=="" (
   powershell.exe -NoLogo -NoProfile -ExecutionPolicy RemoteSigned -File "%~dp0deploy\windows-native\Update.ps1"

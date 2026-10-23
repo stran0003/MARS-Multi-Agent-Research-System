@@ -4,7 +4,7 @@
 
 ## 使用
 
-1. 安装 [官方 ZCode](https://github.com/zai-org/ZCode)。运行环境必须支持 `app-server`。MARS 优先使用 PATH 上的 `zcode`；macOS 也会查找官方应用内的运行入口，需要 Node.js。
+1. Windows 原生用户双击 `MARS-Windows.cmd`，自动安装并握手验证项目内的官方 ZCode 运行组件，无需另装桌面客户端。其他平台可安装 [官方 ZCode](https://github.com/zai-org/ZCode)，需支持 `app-server`。明确配置的 command 优先，其后为项目内已验证组件、PATH 上的 `zcode` 和离线包入口；macOS 还会查找官方应用内入口，需要 Node.js。
 2. 在 MARS 的「模型连接」中配置编码 Agent 的模型、服务地址和 API 凭据。当前本机验证使用 GLM-5.3。ZCode 无需另填上游 API Key。
 3. 在「设置 → 编码引擎」选择 ZCode。设置写入本机 `.env.local`，重启后保留；已有编码调用恢复时仍使用原引擎。
 4. 接入已有 Git 代码仓和资料，审核实验设计后开始编码。MARS 在原仓库中创建任务分支，ZCode 经 MARS 工具读取、修改和检查代码，完成后进入人工审核。

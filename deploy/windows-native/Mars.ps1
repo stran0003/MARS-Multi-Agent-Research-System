@@ -137,6 +137,7 @@ function Install-NativeDependencies {
     Invoke-MarsNativeCommand $uv @('pip', 'install', '--python', $python, '--no-deps', '-e', '.') $root
     Invoke-MarsNativeCommand $uv @('pip', 'check', '--python', $python) $root
     Invoke-MarsNativeCommand $python @('-c', 'import torch, scipy, matplotlib, tensorboard, chromadb, app.main; assert torch.ones(2).sum().item() == 2') $root
+    Invoke-MarsNativeCommand $python @((Join-Path $PSScriptRoot 'ensure_zcode.py')) $root
     Install-FrontendDependencies
     $npm = Join-Path (Split-Path $node) 'node_modules/npm/bin/npm-cli.js'
     Invoke-MarsNativeCommand $node @($npm, 'run', 'typecheck') (Join-Path $root 'frontend')
@@ -209,7 +210,13 @@ function Start-NativeServices {
     Set-NativeEnvironment
     $frontendMode = if ((Test-Path -LiteralPath (Join-Path $root 'WINDOWS-OFFLINE.json')) -or
         (Test-Path -LiteralPath $layout.Offline)) { 'start' } else { 'dev' }
-    if ($frontendMode -eq 'start') { Ensure-FrontendBuild }
+    if ($frontendMode -eq 'start') {
+        Invoke-MarsNativeCommand $python @((Join-Path $PSScriptRoot 'probe_zcode.py')) $root
+        Ensure-FrontendBuild
+    } else {
+        # Repair missing ZCode without rebuilding Python or npm dependencies.
+        Invoke-MarsNativeCommand $python @((Join-Path $PSScriptRoot 'ensure_zcode.py')) $root
+    }
     foreach ($port in @([int]$config.backend_port, [int]$config.frontend_port)) {
         if (Test-MarsPort $port) { throw "Port $port is occupied. Stop its owner or edit configs/windows_native.yaml." }
     }

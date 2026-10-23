@@ -4,7 +4,7 @@
 
 1. 把完整 ZIP 复制到公司电脑。若可信 ZIP 的文件属性显示“解除锁定”，先解除锁定，再解压到短路径，例如 `D:\MARS-Product`。不要直接从压缩包窗口运行。
 2. 双击 `MARS-Windows.cmd`。首次自动校验依赖，安装独立运行环境并构建前端。
-3. 首次按向导配置模型地址、模型名称和 Key。公司网关选择自定义 OpenAI 兼容服务。
+3. 启动后在设置页配置模型地址、模型名称和 Key。也可用 `configure-mars-api.cmd` 打开命令行配置向导；公司网关选择自定义 OpenAI 兼容服务。
 4. 安装、后端健康和前后端代理检查通过后，自动打开 `http://127.0.0.1:3001/`。
 
 以后双击同一个入口直接启动。停止用 `stop-mars-windows-native.cmd`，重新配置 API 用 `configure-mars-api.cmd`，其他管理选项用 `manage-mars-windows.cmd`。

@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -11,6 +14,7 @@ from app.bridge.code_repository import BrowsePolicy, CodeRepository
 from app.bridge.completed_code_changes import _net_diff, _patched, completed_code_changes
 from app.bridge.code_changes import code_changes
 from app.harness.tools.project_repo import ProjectRepo
+from app.harness.tools.git_branch import GitBranch, bind_git_branch, git
 from app.harness.tools.registry import ToolContext, get_registry
 from app.storage.run_store import RunHandle, RunStore
 
@@ -237,3 +241,63 @@ def test_multiple_shifted_hunks_retain_untouched_lines() -> None:
     diff = ("--- a/value.py\n+++ b/value.py\n@@ -1,2 +1,2 @@\n-first\n+new1\n keep1\n"
             "@@ -4,2 +4,2 @@\n-second\n+new2\n keep2\n")
     assert _patched(before, parse_diff(diff)[0]) == before.replace("first", "new1").replace("second", "new2")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('case', ['removed_generated', 'tracked', 'corrupt_receipt', 'recreated'])
+async def test_generated_check_output_cleanup_uses_real_git_net_state(tmp_path: Path, case: str) -> None:
+    run, root, ctx, browser = setup(tmp_path)
+    git(root, 'init', '-b', 'main')
+    (root / 'baseline.py').write_text('VALUE = 1\n')
+    if case == 'tracked':
+        (root / 'probe_out.txt').write_text('baseline output\n')
+    git(root, 'add', '.')
+    git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'baseline')
+    commit = git(root, 'rev-parse', 'HEAD')
+    branch = GitBranch(run.project, run.run_id, str(root), 'main', 'main', commit,
+                       source_repo_path=str(root), initial_commit=commit)
+    browser = CodeRepository(replace(browser.repo, git_branch=branch), browser.policy)
+    receipts = []
+    for content in ['first diagnostic output', 'different output from another real check']:
+        subprocess.run([sys.executable, '-c',
+                        'from pathlib import Path; import sys; Path("probe_out.txt").write_text(sys.argv[1])',
+                        content], cwd=root, check=True, timeout=30)
+        result = await get_registry().dispatch('code.delete_file', {'path': 'probe_out.txt'}, ctx)
+        assert result.ok, result.error
+        receipts.append(result)
+    if case == 'corrupt_receipt':
+        Path(receipts[0].rollback_ref or '').write_text('{}')
+    if case == 'recreated':
+        (root / 'probe_out.txt').write_text('still here')
+    with bind_git_branch(branch):
+        view = completed_code_changes(run, project=run.project, repository=browser)
+    assert not view['items']
+    if case == 'removed_generated':
+        assert not view['warnings']
+        assert view['unchanged'] == [{'path': 'probe_out.txt', 'sha256': None, 'exists': False,
+                                      'source': 'verified_git_net_state'}]
+    else:
+        assert view['warnings'], 'Retained files, baseline deletions and corrupt receipts stay reviewable'
+
+
+@pytest.mark.asyncio
+async def test_system_cleanup_is_independent_evidence_for_removed_new_output(tmp_path: Path) -> None:
+    run, root, ctx, browser = setup(tmp_path)
+    git(root, 'init', '-b', 'main')
+    (root / 'baseline.py').write_text('VALUE = 1\n')
+    git(root, 'add', '.')
+    git(root, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', 'commit', '-m', 'baseline')
+    commit = git(root, 'rev-parse', 'HEAD')
+    branch = GitBranch(run.project, run.run_id, str(root), 'main', 'main', commit,
+                       source_repo_path=str(root), initial_commit=commit)
+    browser = CodeRepository(replace(browser.repo, git_branch=branch), browser.policy)
+    for name in ['probe.py', 'baseline.py']:
+        result = await get_registry().dispatch('code.write_file', {'path': name, 'content': 'VALUE = 2\n'}, ctx)
+        assert result.ok, result.error
+        result = await get_registry().dispatch('code.delete_file', {'path': name}, replace(ctx, agent='system'))
+        assert result.ok, result.error
+    with bind_git_branch(branch):
+        view = completed_code_changes(run, project=run.project, repository=browser)
+    assert [row['path'] for row in view['unchanged']] == ['probe.py']
+    assert not view['items'] and len(view['warnings']) == 1
+    assert 'baseline.py' in view['warnings'][0]

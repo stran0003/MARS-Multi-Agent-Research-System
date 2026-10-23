@@ -16,6 +16,8 @@ from app.bridge.code_repository import CodeRepository, run_code_repository
 from app.settings import repo_root
 from app.storage.run_store import RunHandle
 from app.harness.tools.code.file_snapshot import FileContent, content_bytes, snapshot_content
+from app.harness.tools.git_branch import git, receipt_path, saved_branch
+from app.harness.tools.project_repo import load_project_repo
 
 
 @dataclass
@@ -157,6 +159,24 @@ def _net_diff(path: str, before: FileContent, after: FileContent, context: int) 
                                       "old_line": None, "new_line": None}]}
 
 
+def _absent_at_git_start(browser: CodeRepository, run: RunHandle, path: str) -> bool:
+    """A removed generated file has no net change, even if checks recreated it.
+
+    This is independent Git evidence, not a reconstruction of missing writes.
+    Retained files and files present in the starting tree still need receipts.
+    """
+    branch = browser.repo.git_branch
+    if branch is None and receipt_path(run.root).is_file():
+        branch = saved_branch(load_project_repo(run.project).root, run.root, run.project, run.run_id)
+    if branch is None or branch.root.resolve() != browser.repo.root.resolve():
+        return False
+    branch.validate(run.project, run.run_id)
+    start = branch.initial_commit or branch.baseline_commit
+    if re.fullmatch(r'[0-9a-f]{40,64}', start) is None:
+        return False
+    return not git(branch.root, 'ls-tree', '-z', start, '--', ':(literal)' + path)
+
+
 def completed_code_changes(run: RunHandle, *, project: str, change_id: str | None = None,
                            repository: CodeRepository | None = None) -> dict[str, Any]:
     if run.project != project:
@@ -207,6 +227,7 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
         raise ValueError("改动记录超出核对范围，不能展示不完整的改动统计")
     warnings: list[str] = []
     records: list[dict[str, Any]] = []
+    cleanup_records: list[dict[str, Any]] = []
     for record_path in paths:
         try:
             record = json.loads(_read(record_path, run.root, policy["max_record_bytes"]))
@@ -214,10 +235,14 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
                     and record.get("agent") == "coding" and record.get("status") == "success"
                     and record.get("tool") in {"code.write_file", "code.delete_file", "code.apply_patch", "code.copy_yaml", "zcode.Write", "zcode.Edit"}):
                 records.append(record)
+            elif (record.get('run_id') == run.run_id and record.get('project') == project
+                    and record.get('agent') == 'system' and record.get('status') == 'success'
+                    and record.get('tool') == 'code.delete_file'):
+                cleanup_records.append(record)
         except (OSError, ValueError, AttributeError):
             warnings.append(f"{record_path.name} 无法安全核对。")
     # Reads and unsuccessful attempts never consume the budget for real writes.
-    if len(records) > policy["max_records"]:
+    if len(records) + len(cleanup_records) > policy["max_records"]:
         raise ValueError("写入记录超出核对范围，不能展示不完整的改动统计")
     records.sort(key=lambda record: (str(record.get("ended_at") or record.get("started_at") or ""), str(record["call_id"])))
     changes: dict[str, FileChange] = {}
@@ -248,6 +273,18 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
                 if path in changes:
                     changes[path].valid = False
             warnings.append(f"{record['call_id']} 缺少可验证的写入快照，未计入已完成改动。")
+    # Maintenance may remove an agent's diagnostic files while the task is
+    # stopped. Only a valid, newer terminal delete can explain that absence.
+    # It never attributes a maintenance edit/deletion of baseline code to Coding.
+    cleaned: set[str] = set()
+    for record in cleanup_records:
+        try:
+            for path, _before, after in _operations(run, record, policy['max_record_bytes']):
+                if (after is None and path in changes and
+                        str(record.get('ended_at') or '') >= changes[path].timestamp):
+                    cleaned.add(path)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            warnings.append(f"{record['call_id']} 缺少可验证的维护清理快照。")
     browser = repository or (run_code_repository(run, project=project) if changes else None)
     if browser is not None and browser.repo.project != project:
         raise ValueError("代码工程所属项目不匹配")
@@ -255,18 +292,24 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
     unchanged: list[dict[str, Any]] = []
     for path, change in sorted(changes.items()):
         try:
-            if not change.valid:
-                raise ValueError("write chain mismatch")
             if browser is None:
                 raise ValueError("missing bound repository")
             try:
                 current = browser.file(path)
             except FileNotFoundError:
+                if change.after is not None and path not in cleaned:
+                    raise
+                if path not in unverified_paths and _absent_at_git_start(browser, run, path):
+                    unchanged.append({'path': path, 'sha256': None, 'exists': False,
+                                      'source': 'verified_git_net_state'})
+                    continue
                 if change.after is not None:
                     raise
             else:
                 if change.after is None or current["version"] != hashlib.sha256(content_bytes(change.after)).hexdigest():
                     raise ValueError("current file differs from the completed write")
+            if not change.valid:
+                raise ValueError("write chain mismatch")
             if change.before == change.after:
                 unchanged.append({"path": path, "sha256": hashlib.sha256(content_bytes(change.after)).hexdigest()
                                   if change.after is not None else None,

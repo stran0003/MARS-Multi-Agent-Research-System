@@ -34,3 +34,38 @@ The selected source implementation and new adapter differ from the previously va
 The previous 80M independent SciPy/checkpoint verification recorded RES 4.4087 dB using the 75 MHz filter and its frozen 5 MHz window. These differences identify implementation/protocol drift and a measured train/validation gap; their individual causal contributions require controlled retraining. No new performance or successful repair is claimed. No approved scientific files, data, checkpoints or failure records were overwritten by this diagnosis.
 
 Local read-only reproduction: `outputs/mars-maintenance-01a12379/diagnose_80m_20261023.py` and its JSON output (outside the MARS repository).
+
+## Follow-up: independent holdout and genuine-model controls
+
+The user's report-review submission is confirmed. It did not create a new Coding task. Further diagnosis used saved genuine checkpoints, CPU inference with two threads, and temporary in-memory PP/weight ablations only. No optimizer ran, no research source/checkpoint/result/approval was overwritten, and no new MARS scientific result was submitted.
+
+### The current validation model contributes effectively no cancellation
+
+Under the current run's own 70 MHz filter / 34 MHz-centered 5 MHz scoring protocol, setting the prediction to zero gives validation RES **23.5489 dB**. Its actual learned prediction gives **23.5655 dB**, or **-0.0166 dB** cancellation relative to that zero-prediction control. The reported **0.4896 dB** PIM-to-RES reduction is therefore explained by applying the error FIR again to an already prefiltered RX, not by useful learned cancellation in that window. This is particularly material because the wrong filter's transition band crosses the scoring window. The finite, genuine model was trained; reproducing the saved validation prediction again gave maximum absolute difference **0**.
+
+Training-only RES is **10.4101 dB**, compared with **23.5655 dB** on the adjacent validation segment. A later, disjoint segment is also poor (**24.1692 dB** under the current protocol). This establishes a train/holdout generalization gap rather than an isolated bad validation slice or a missing execution.
+
+### The same uploaded data supports the previously measured performance
+
+Use the common 75 MHz total RX filter, original frozen 34.32 MHz-centered 5 MHz window, and 256-point edge trim on samples **[184320,225280)**. This segment was not used to train either genuine model.
+
+| Genuine trained model | RES on the common independent holdout |
+| --- | ---: |
+| Current MARS run checkpoint | 24.6635 dB |
+| Previously verified 80M checkpoint | 4.4087 dB |
+
+This comparison uses the current uploaded MAT, so the original data and its 3450 MHz TDD LO are not inherently preventing good performance. It also excludes differences in scoring window/time segment as an explanation for the large model-performance gap.
+
+### PP count is not established as the cause
+
+In the already trained reference model, zeroing only the second PP (`conj(A)*B`) leaves **RES 4.3719 dB** on that same independent holdout. Keeping only the second PP gives **25.5754 dB**. This describes branch contribution in this trained reference and window; it is not a new independently trained one-PP baseline and does not prove the second PP is universally unnecessary. It does rule out simply blaming the current failure on the missing second PP.
+
+For an implementation-capacity check, the genuine reference A-only weights were mapped **in memory** into the current model: split `L1AB` by TX, embed its TDD dilation-2 taps into even locations of the current dilation-1 FIR, map the active LUT, and compensate the output divisor by 4096/32768. The current implementation then obtained **4.3719 dB** under the common protocol, matching the reference A-only result within **0.000001 dB**. The present one-PP architecture can therefore represent the good mapping; its saved learned weights did not learn it. Applying the current 70 MHz preprocessing/scoring to those transferred predictions gives **7.5673 dB**, further confirming that the filter/protocol discrepancy changes the measured result even for good weights. The transferred weights were never saved or deployed.
+
+### Where the new training recipe came from and what remains unresolved
+
+Inspection of original bound source commit `ff327602b1e6766df7b773152db16909f25e21c0` shows that the new upload configuration retained the `configs/singleband.yaml` example's training recipe: offset 0, training/validation 24576/6144 samples, 12 batches, 300 circles, learning rate 0.001 and scheduler step 100. Coding correctly identified the 80M dual-TX MAT and changed channel/LO/scale settings, but this was not the previously verified 80M recipe (offset 20480, training/validation 163840/40960, 80 batches, 150 epochs, learning rate 0.004 and step 30). RX divisor and TX FIR parametrization also differ. The current training log evaluates validation only after all training has finished; native training statistics additionally re-detect the error peak, so they are not a consistent monitor of held-out fixed-window performance.
+
+**Confirmed:** inappropriate reuse of the small single-band example recipe instead of reproduction of the established 80M recipe; actual FIR/configuration mismatch; inconsistent native training statistics; poor learned generalization; and report revision instead of code repair. **Not individually proven:** how much of the learned-weight gap is caused by sample count, learning rate/schedule, normalization, or their interaction. Changing the filter or report alone cannot repair the saved weights. A real repair needs an explicitly reviewed training configuration, effective-filter inspection, frozen shared metrics, periodic train/validation evaluation, and genuine retraining; this diagnosis does not claim that retraining has happened or succeeded.
+
+Reproduction script (outside MARS Git): `outputs/mars-maintenance-01a12379/diagnose_80m_generalization_20261023.py`; invoke with `current`, `reference`, and `current --transfer-reference-weights`. Outputs are the corresponding `diagnose_80m_generalization_{current,reference,current_transferred}_20261023.json` files in that directory. They contain per-channel results, zero-prediction controls, scoring settings, spans, and LUT input diagnostics. Trained LUT inputs exceed 1 at roughly 0.54% of current training points and 0.56% of validation points; an abrupt validation-only LUT-range shift is not demonstrated.

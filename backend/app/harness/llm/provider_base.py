@@ -1,0 +1,189 @@
+"""LLM provider abstraction.
+
+Every provider implements ``complete()`` (one-shot) and ``stream()`` (delta
+iterator). The same interface is used by real APIs and by local vLLM
+(OpenAI-compatible). Missing providers must fail explicitly.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass, field
+import math
+from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+
+Role = Literal["system", "user", "assistant", "tool"]
+ReasoningEffort = Literal["low", "medium", "high", "max"]
+MAX_LLM_RETRIES = 3
+DEFAULT_LLM_TIMEOUT_SECONDS = 720.0
+LLM_CALL_DEADLINE_GRACE_SECONDS = 5.0
+
+
+def model_request_timeout(value: Any = None) -> float:
+    """Migrate deployment settings to a slow-model floor, preserving longer waits.
+
+    Explicit per-operation deadlines (including cancellation tests) may still
+    use LLMConfig directly; this applies at configuration loading boundaries.
+    """
+    seconds = DEFAULT_LLM_TIMEOUT_SECONDS if value is None else float(value)
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError("Model request timeout must be finite and positive")
+    return max(DEFAULT_LLM_TIMEOUT_SECONDS, seconds)
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    id: str
+    name: str
+    arguments: str
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"id": self.id, "type": "function", "function": {
+            "name": self.name, "arguments": self.arguments}}
+
+
+@dataclass(frozen=True)
+class Message:
+    role: Role
+    content: str
+    tool_calls: tuple[ToolCall, ...] = ()
+    tool_call_id: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"role": self.role, "content": self.content}
+        if self.tool_calls:
+            if self.role != "assistant":
+                raise ValueError("tool calls require assistant role")
+            result["tool_calls"] = [call.to_wire() for call in self.tool_calls]
+        if self.role == "tool":
+            if not self.tool_call_id:
+                raise ValueError("tool result requires call id")
+            result["tool_call_id"] = self.tool_call_id
+        return result
+
+
+@dataclass
+class LLMConfig:
+    provider: str
+    model: str
+    temperature: float = 0.7
+    max_tokens: int = 4096
+    top_p: float = 1.0
+    response_schema: str | None = None
+    thinking_enabled: bool | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    request_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
+    max_retries: int = 3
+    retry_base_delay_seconds: float = 1.0
+    json_mode: bool = False
+    tools: tuple[dict[str, Any], ...] = ()
+    attempt_observer: Callable[[str, dict[str, Any]], None] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class Completion:
+    text: str
+    provider: str
+    model: str
+    is_mock: bool = False
+    debate_role: str | None = None
+    tool_calls: tuple[ToolCall, ...] = ()
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+class LLMCompletionError(RuntimeError):
+    """Structured, content-free reason for an unusable provider completion."""
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        provider: str,
+        model: str,
+        finish_reason: str | None,
+        empty_final: bool,
+        usage: dict[str, Any] | None = None,
+        model_identity: dict[str, Any] | None = None,
+    ) -> None:
+        self.usage = usage
+        self.model_identity = dict(model_identity or {})
+        self.reason: dict[str, str | bool | None] = {
+            "code": code,
+            "provider": provider,
+            "model": model,
+            "finish_reason": finish_reason,
+            "empty_final": empty_final,
+        }
+        super().__init__(
+            f"{code}: provider={provider} model={model} "
+            f"finish_reason={finish_reason or 'unknown'} empty_final={empty_final}"
+        )
+
+
+@dataclass
+class Delta:
+    text: str
+    finish_reason: str | None = None
+    usage: dict[str, Any] | None = None
+
+
+class LLMProvider(ABC):
+    name: str = "base"
+    budget_attempts_observable: bool = False
+
+    @property
+    def base_url(self) -> str | None:
+        """Effective endpoint identity; implementations must not expose credentials."""
+        return None
+
+    async def close(self) -> None:
+        """Release any resources owned by the provider."""
+
+    @abstractmethod
+    async def complete(
+        self, messages: list[Message], config: LLMConfig
+    ) -> Completion: ...
+
+    @abstractmethod
+    def stream(
+        self, messages: list[Message], config: LLMConfig
+    ) -> AsyncIterator[Delta]:
+        """Subclasses implement as ``async def`` with ``yield`` (async generator).
+
+        The non-async signature here is required by mypy: an async generator
+        function's declared return type is ``AsyncIterator[T]``, not
+        ``Coroutine[..., AsyncIterator[T]]``.
+        """
+        ...
+
+
+def public_endpoint_url(value: str) -> str:
+    """Keep endpoint routing information while removing URL credentials."""
+    parsed = urlsplit(value)
+    authority = parsed.netloc.rsplit("@", 1)[-1]
+    # Endpoint services may put bearer credentials under arbitrary names such
+    # as auth or sig. No unknown query value is safe diagnostic metadata.
+    query = [(name, "REDACTED") for name, _ in parse_qsl(parsed.query, keep_blank_values=True)]
+    return urlunsplit((parsed.scheme, authority, parsed.path.rstrip("/"), urlencode(query), ""))
+
+
+def llm_call_deadline_seconds(
+    config: LLMConfig,
+    *,
+    minimum_seconds: float = 0.0,
+) -> float:
+    """Outer deadline that cannot preempt configured attempts/backoff."""
+
+    max_retries = min(max(config.max_retries, 0), MAX_LLM_RETRIES)
+    request_timeout = max(config.request_timeout_seconds, 0.0)
+    base_delay = max(config.retry_base_delay_seconds, 0.0)
+    backoff_seconds = sum(base_delay * (2**attempt) for attempt in range(max_retries))
+    provider_budget = (
+        request_timeout * (max_retries + 1)
+        + backoff_seconds
+        + LLM_CALL_DEADLINE_GRACE_SECONDS
+    )
+    return float(max(minimum_seconds, provider_budget))

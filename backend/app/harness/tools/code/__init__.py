@@ -1,0 +1,795 @@
+"""Code tools registered through the generic tool registry."""
+from __future__ import annotations
+
+import asyncio
+import difflib
+import fnmatch
+import hashlib
+import json
+import re
+import time
+import uuid
+from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+from app.harness.project_workspace import project_root
+from app.harness.persistence import atomic_write_text, atomic_write_bytes
+from app.harness.runtime.git_runtime import GitRuntimeError, git_environment, resolve_git
+from app.harness.runtime.project_scope import current_project_scope, validated_diff_paths
+from app.harness.tools.config import check_commands, command_timeout_seconds, tool_config
+from app.harness.tools.registry import ToolContext, ToolResult
+from app.harness.tools.code.patch_text import normalize_patch
+from app.harness.tools.code.file_snapshot import FileSnapshot, FileContent, snapshot_content
+from app.harness.tools.process_runtime import communicate_process, start_process
+from app.settings import repo_root
+
+_MAX_READ_BYTES = 20_000
+_TEXT_SUFFIXES = {
+    ".c",
+    ".cfg",
+    ".cpp",
+    ".cu",
+    ".h",
+    ".hpp",
+    ".ini",
+    ".json",
+    ".m",
+    ".md",
+    ".py",
+    ".sh",
+    ".toml",
+    ".txt",
+    ".yaml",
+    ".yml",
+}
+
+
+async def repo_reader_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Read a source file from the configured project repo."""
+    path = str(args.get("path", "")).strip()
+    if not path:
+        return ToolResult(ok=False, error="path is required")
+    # Task context commonly carries absolute filenames. Normalize only reads
+    # inside the active repository; the existing resolver still checks scope,
+    # allowlists, ignored paths and symlink escapes. Writes remain relative.
+    if Path(path).is_absolute():
+        try:
+            root = _project_root(ctx)
+            if root is None:
+                return ToolResult(ok=False, error=f"project repo for '{ctx.project}' is not connected")
+            if ".." in Path(path).parts:
+                return ToolResult(ok=False, error="invalid project-relative path")
+            path = Path(path).relative_to(root.resolve()).as_posix()
+        except ValueError:
+            return ToolResult(ok=False, error="absolute read path is outside the active project repo")
+    resolved = _resolve_project_file(ctx, path, must_exist=True)
+    if isinstance(resolved, ToolResult):
+        return resolved
+    root, rel, target = resolved
+    if target.suffix.lower() not in _TEXT_SUFFIXES:
+        return ToolResult(ok=False, error=f"unsupported code file type '{target.suffix}'")
+    raw = target.read_text(encoding="utf-8", errors="replace")
+    offset = args.get("char_offset", 0)
+    if type(offset) is not int or offset < 0 or (raw and offset >= len(raw)):
+        return ToolResult(ok=False, error="char_offset must identify a character inside the file")
+    limit = _MAX_READ_BYTES
+    if ctx.extra.get("run_root"):
+        from app.harness.context.runtime_policy import freeze_policy
+        policy = freeze_policy(Path(str(ctx.extra["run_root"])))
+        if policy.get("version") == 3:
+            limit = min(limit, int(policy["read_chars"]))
+    end = min(len(raw), offset + limit)
+    return ToolResult(
+        ok=True,
+        output={
+            "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+            "repo_root": str(root),
+            "path": rel,
+            "truncated": end < len(raw),
+            "char_start": offset, "char_end": end, "total_chars": len(raw),
+            "next_offset": end if end < len(raw) else None,
+            "content": raw[offset:end],
+        },
+        evidence_refs=[rel],
+    )
+
+
+async def patch_generator_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Generate or normalize a unified diff for a project file."""
+    diff = normalize_patch(str(args.get("diff", "")))
+    if diff:
+        error = _bound_diff_error(ctx, diff)
+        if error:
+            return ToolResult(ok=False, error=error)
+        return ToolResult(
+            ok=True,
+            output={"diff": diff, "files": [{"path": p} for p in _extract_diff_paths(diff)]},
+            evidence_refs=_extract_diff_paths(diff),
+        )
+    path = str(args.get("path", "")).strip()
+    content = args.get("content")
+    if not path or not isinstance(content, str):
+        return ToolResult(ok=False, error="path and content are required when diff is omitted")
+    resolved = _resolve_project_file(ctx, path, must_exist=False, for_write=True)
+    if isinstance(resolved, ToolResult):
+        return resolved
+    _root, rel, target = resolved
+    before = target.read_text(encoding="utf-8", errors="replace").splitlines(keepends=True) if target.exists() else []
+    after = content.splitlines(keepends=True)
+    rendered = "".join(
+        difflib.unified_diff(
+            before,
+            after,
+            fromfile=f"a/{rel}",
+            tofile=f"b/{rel}",
+        )
+    )
+    return ToolResult(
+        ok=True,
+        output={"diff": rendered, "files": [{"path": rel}]},
+        evidence_refs=[rel],
+    )
+
+
+async def copy_yaml_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    from app.harness.tools.code.yaml_copy import copy_yaml
+    return await copy_yaml(args, ctx)
+
+
+async def write_file_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Write a text file under the configured project repo."""
+    read_only_error = _read_only_error(ctx)
+    if read_only_error:
+        return ToolResult(ok=False, error=read_only_error)
+    path = str(args.get("path", "")).strip()
+    content = args.get("content")
+    if not path or not isinstance(content, str):
+        return ToolResult(ok=False, error="path and string content are required")
+    resolved = _resolve_project_file(ctx, path, must_exist=False, for_write=True)
+    if isinstance(resolved, ToolResult):
+        return resolved
+    _root, rel, target = resolved
+    snapshots = [_snapshot(rel, target)]
+    from app.harness.evolution import check_evolution_write
+    try:
+        check_evolution_write(_root, rel, content)
+    except ValueError as exc:
+        return ToolResult(ok=False, error=str(exc))
+    if ctx.dry_run:
+        return ToolResult(ok=True, output={"dry_run": True, "path": rel})
+    target.parent.mkdir(parents=True, exist_ok=True)
+    rollback_ref = _write_rollback(ctx, "code.write_file", snapshots,
+        after_snapshots=[FileSnapshot(rel, True, _sha_text(content), content)])
+    atomic_write_text(target, content)
+    _record_branch_write(ctx, [rel])
+    return ToolResult(
+        ok=True,
+        output={
+            "path": rel,
+            "sha256": _sha_text(content),
+            "bytes": len(content.encode("utf-8")),
+        },
+        rollback_ref=rollback_ref,
+        evidence_refs=[rel],
+    )
+
+
+async def delete_file_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Delete a writable project file, preserving a recovery snapshot first."""
+    read_only_error = _read_only_error(ctx)
+    if read_only_error:
+        return ToolResult(ok=False, error=read_only_error)
+    path = str(args.get("path", "")).strip()
+    if not path:
+        return ToolResult(ok=False, error="path is required")
+    resolved = _resolve_project_file(ctx, path, must_exist=True, for_write=True)
+    if isinstance(resolved, ToolResult):
+        return resolved
+    _root, rel, target = resolved
+    snapshots = [_snapshot(rel, target)]
+    from app.harness.evolution import check_evolution_write
+    try:
+        check_evolution_write(_root, rel, None)
+    except ValueError as exc:
+        return ToolResult(ok=False, error=str(exc))
+    if ctx.dry_run:
+        return ToolResult(ok=True, output={"dry_run": True, "path": rel})
+    rollback_ref = _write_rollback(ctx, "code.delete_file", snapshots)
+    target.unlink()
+    _record_branch_write(ctx, [rel])
+    return ToolResult(ok=True, output={"deleted": rel}, rollback_ref=rollback_ref, evidence_refs=[rel])
+
+
+async def apply_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Apply a unified diff to the configured project repo using ``git apply``."""
+    version = str(args.get("version", "v1"))
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", version) is None:
+        return ToolResult(ok=False, error="invalid patch version")
+    read_only_error = _read_only_error(ctx)
+    if read_only_error:
+        payload = _patch_result_payload(ctx, version, applied=False, error=read_only_error)
+        _write_patch_result(ctx, version, payload)
+        return ToolResult(ok=False, output=payload, error=read_only_error)
+    diff = normalize_patch(str(args.get("diff", "")))
+    if not diff and args.get("patch_path"):
+        from app.harness.tools.git_branch import current_git_branch
+        if (current_project_scope(ctx.project, ctx.run_id) is not None
+                or current_git_branch(ctx.project, ctx.run_id) is not None):
+            resolved_patch = _resolve_project_file(ctx, str(args['patch_path']), must_exist=True)
+            if isinstance(resolved_patch, ToolResult):
+                return resolved_patch
+            patch_path = resolved_patch[2]
+        else:
+            patch_path = Path(str(args["patch_path"]))
+            if not patch_path.is_absolute():
+                patch_path = repo_root() / patch_path
+        if not patch_path.is_file():
+            return ToolResult(ok=False, error=f"patch not found: {patch_path}")
+        diff = normalize_patch(patch_path.read_text(encoding="utf-8", errors="replace"))
+    if not diff:
+        return ToolResult(ok=False, error="diff or patch_path is required")
+    error = _bound_diff_error(ctx, diff)
+    if error:
+        return ToolResult(ok=False, error=error)
+    root = _project_root(ctx)
+    if root is None:
+        return ToolResult(ok=False, error=f"project repo for '{ctx.project}' is not connected")
+    files = (list(validated_diff_paths(diff)) if current_project_scope(ctx.project, ctx.run_id)
+             else _extract_diff_paths(diff))
+    for rel in files:
+        resolved = _resolve_project_file(ctx, rel, must_exist=False, for_write=True)
+        if isinstance(resolved, ToolResult):
+            return resolved
+    snapshots = [_snapshot(rel, root / rel) for rel in files]
+    isolated = current_project_scope(ctx.project, ctx.run_id) is not None
+    if ctx.dry_run:
+        ok = await _git_apply(root, diff, check_only=True, isolated=isolated)
+        return ToolResult(ok=ok.ok, output=ok.output, error=ok.error, evidence_refs=files)
+    check = await _git_apply(root, diff, check_only=True, isolated=isolated)
+    if not check.ok:
+        payload = _patch_result_payload(
+            ctx,
+            version,
+            applied=False,
+            error=check.error,
+            command_result=check.output if isinstance(check.output, dict) else None,
+            files=files,
+            repo_root=root,
+        )
+        _write_patch_result(ctx, version, payload)
+        return check
+    applied = await _git_apply(root, diff, check_only=False, isolated=isolated)
+    if not applied.ok:
+        payload = _patch_result_payload(
+            ctx,
+            version,
+            applied=False,
+            error=applied.error,
+            command_result=applied.output if isinstance(applied.output, dict) else None,
+            files=files,
+            repo_root=root,
+        )
+        _write_patch_result(ctx, version, payload)
+        return applied
+    from app.harness.evolution import check_evolution_write
+    try:
+        for name in files:
+            changed = root / name
+            check_evolution_write(root, name, changed.read_text() if changed.is_file() else None)
+    except (ValueError, OSError) as exc:
+        for snapshot in snapshots:
+            target = root / snapshot.path
+            if snapshot.existed:
+                original = snapshot_content(asdict(snapshot))
+                if isinstance(original, bytes):
+                    atomic_write_bytes(target, original)
+                else:
+                    atomic_write_text(target, snapshot.content)
+            else:
+                target.unlink(missing_ok=True)
+        return ToolResult(ok=False, error=str(exc))
+    rollback_ref = _write_rollback(ctx, "code.apply_patch", snapshots,
+        after_snapshots=[_snapshot(rel, root / rel) for rel in files])
+    payload = _patch_result_payload(
+        ctx,
+        version,
+        applied=True,
+        command_result=applied.output if isinstance(applied.output, dict) else None,
+        files=files,
+        repo_root=root,
+        rollback_ref=rollback_ref,
+    )
+    _write_patch_result(ctx, version, payload)
+    _record_branch_write(ctx, files)
+    return ToolResult(
+        ok=True,
+        output={"applied": True, "files": [{"path": p} for p in files]},
+        rollback_ref=rollback_ref,
+        evidence_refs=files,
+    )
+
+
+async def rollback_patch_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    """Restore files from a rollback snapshot generated by a mutating code tool."""
+    error = _read_only_error(ctx)
+    if error:
+        return ToolResult(ok=False, error=error)
+    rollback_ref = str(args.get("rollback_ref", "")).strip()
+    if not rollback_ref:
+        return ToolResult(ok=False, error="rollback_ref is required")
+    if current_project_scope(ctx.project, ctx.run_id) is not None:
+        return _bound_rollback(ctx, rollback_ref)
+    path = Path(rollback_ref)
+    if not path.is_absolute():
+        path = repo_root() / rollback_ref
+    from app.harness.tools.git_branch import current_git_branch
+    branch = current_git_branch(ctx.project, ctx.run_id)
+    if branch is not None:
+        run_root = Path(str(ctx.extra.get("run_root") or repo_root() / "runs" / ctx.run_id)).resolve()
+        try:
+            relative = path.relative_to(run_root).as_posix()
+            if not relative.startswith("coding/tool_applications/"):
+                raise ValueError("Rollback must belong to this run")
+            from app.harness.runtime.project_scope import safe_scope_path
+            path = safe_scope_path(run_root, relative, must_exist=True)
+        except ValueError as exc:
+            return ToolResult(ok=False, error=str(exc))
+    if not path.is_file():
+        return ToolResult(ok=False, error=f"rollback snapshot not found: {rollback_ref}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if branch is not None and (not isinstance(data, dict) or data.get("schema") != "tool_rollback.v1"
+            or data.get("run_id") != ctx.run_id or data.get("project") != ctx.project):
+        return ToolResult(ok=False, error="Rollback identity does not belong to this run")
+    raw_snapshots = data.get("snapshots", [])
+    if not isinstance(raw_snapshots, list):
+        return ToolResult(ok=False, error="rollback snapshot is malformed")
+    root = _project_root(ctx)
+    if root is None:
+        return ToolResult(ok=False, error=f"project repo for '{ctx.project}' is not connected")
+    targets: list[tuple[FileContent, str, Path]] = []
+    for item in raw_snapshots:
+        if not isinstance(item, dict):
+            continue
+        rel = str(item.get("path", ""))
+        resolved = _resolve_project_file(ctx, rel, must_exist=False, for_write=True)
+        if isinstance(resolved, ToolResult):
+            return resolved
+        try:
+            targets.append((snapshot_content(item), rel, resolved[2]))
+        except ValueError as exc:
+            return ToolResult(ok=False, error=str(exc))
+    restored: list[str] = []
+    for content, rel, target in targets:
+        if content is not None:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(content, bytes):
+                atomic_write_bytes(target, content)
+            else:
+                atomic_write_text(target, content,
+                    newline='' if data.get('text_mode') == 'utf8_exact' else None)
+        elif target.exists():
+            target.unlink()
+        restored.append(rel)
+    _record_branch_write(ctx, restored)
+    return ToolResult(
+        ok=True,
+        output={"rolled_back": restored},
+        status="success",
+        events=[{"event": "tool.rolled_back", "rollback_ref": str(path)}],
+        evidence_refs=restored,
+    )
+
+
+async def test_runner_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    return await _run_configured_commands("test", args, ctx)
+
+
+async def lint_tool(args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    return await _run_configured_commands("lint", args, ctx)
+
+
+async def _run_configured_commands(kind: str, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    if current_project_scope(ctx.project, ctx.run_id) is not None:
+        return ToolResult(ok=False, error="Contract command execution requires command and budget binding; not admitted")
+    root = _project_root(ctx)
+    if root is None:
+        return ToolResult(ok=False, error=f"project repo for '{ctx.project}' is not connected")
+    tool_name = "code.test_runner" if kind == "test" else "code.lint"
+    requested = str(args.get("command_id", "")).strip()
+    commands = check_commands(kind)
+    available = [{"id": cmd.id, "label": cmd.label, "argv": list(cmd.argv)} for cmd in commands]
+    if requested:
+        commands = tuple(cmd for cmd in commands if cmd.id == requested)
+    if not commands:
+        error = (f"unknown {kind} command_id '{requested}'; choose a configured id or omit command_id"
+                 if available and requested else f"no {kind} commands configured; not executed")
+        return ToolResult(ok=False, error=error, output={"commands": available, "executed": False})
+    allowlist = tool_config(tool_name).command_allowlist
+    timeout = command_timeout_seconds()
+    results: list[dict[str, Any]] = []
+    for command in commands:
+        if not _command_allowed(command.argv, allowlist):
+            return ToolResult(
+                ok=False,
+                error=f"{command.id} is not allowlisted for {tool_name}",
+                output={"argv": list(command.argv)},
+            )
+        from app.harness.tools.check_interpreter import check_argv
+        argv = check_argv(command.argv)
+        from app.harness.tools.code.check_environment import check_environment
+        try:
+            environment = check_environment(ctx, root, project_binding=command.project_binding)
+        except (OSError, ValueError) as exc:
+            return ToolResult(ok=False, error=f'{command.id} input binding failed: {exc}',
+                              output={'executed': False})
+        from app.harness.tools.code.check_receipts import build_check_identity, record_check, reuse_check
+        identity = build_check_identity(ctx, root, kind, command, argv, environment,
+                                        tool_config(tool_name), timeout)
+        cached = reuse_check(identity)
+        if cached is not None:
+            results.append(cached)
+            continue
+        started = time.monotonic()
+        process = await start_process(
+            argv,
+            backend=tool_config(tool_name).process_backend,
+            require_isolation=tool_config(tool_name).require_isolation,
+            cwd=str(root),
+            env=environment,
+            replace_environment=True,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await communicate_process(process, timeout=timeout)
+        except asyncio.TimeoutError:
+            return ToolResult(ok=False, error=f"{command.id} timed out after {timeout}s")
+        result = {
+                "id": command.id,
+                "label": command.label,
+                "argv": list(argv),
+                "returncode": process.returncode,
+                "stdout": _check_output_excerpt(stdout.decode("utf-8", errors="replace")),
+                "stderr": _check_output_excerpt(stderr.decode("utf-8", errors="replace")),
+            }
+        results.append(record_check(identity, result, pid=process.pid,
+                                    duration_seconds=time.monotonic() - started))
+    ok = all(item["returncode"] == 0 for item in results)
+    return ToolResult(ok=ok, output={"kind": kind, "results": results})
+
+
+def _check_output_excerpt(text: str, limit: int = 4000) -> str:
+    """Keep failure evidence before long warnings as well as the final summary."""
+    if len(text) <= limit:
+        return text
+    marker = "\n... [output truncated; beginning and final summary retained] ...\n"
+    remaining = limit - len(marker)
+    head = remaining // 2
+    return text[:head] + marker + text[-(remaining - head):]
+
+
+def _command_allowed(
+    argv: tuple[str, ...],
+    allowlist: tuple[tuple[str, ...], ...],
+) -> bool:
+    if not allowlist:
+        return False
+    for prefix in allowlist:
+        if len(argv) >= len(prefix) and argv[: len(prefix)] == prefix:
+            return True
+    return False
+
+
+async def _git_apply(root: Path, diff: str, *, check_only: bool, isolated: bool = False) -> ToolResult:
+    try:
+        executable = resolve_git().executable
+    except GitRuntimeError as exc:
+        return ToolResult(ok=False, error=str(exc), output={"code": exc.reason["code"]})
+    argv = [executable, "apply", "--whitespace=nowarn", "--recount", "--unidiff-zero"]
+    if isolated:
+        # Candidate directories may live below the MARS git checkout. Do not
+        # discover its index/worktree or honor ambient GIT_WORK_TREE routing.
+        argv.append("--no-index")
+    if check_only:
+        argv.append("--check")
+    process = await start_process(
+        argv,
+        cwd=str(root),
+        env=git_environment(),
+        replace_environment=True,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await communicate_process(process, input_data=diff.encode("utf-8"), timeout=command_timeout_seconds())
+    output = {
+        "argv": argv,
+        "returncode": process.returncode,
+        "stdout": stdout.decode("utf-8", errors="replace")[-4000:],
+        "stderr": stderr.decode("utf-8", errors="replace")[-4000:],
+    }
+    if process.returncode != 0:
+        error_text = str(output["stderr"] or output["stdout"])
+        return ToolResult(ok=False, error=error_text, output=output)
+    return ToolResult(ok=True, output=output)
+
+
+def _read_only_error(ctx: ToolContext) -> str:
+    if current_project_scope(ctx.project, ctx.run_id) is not None:
+        return ""
+    from app.harness.tools.git_branch import current_git_branch
+    try:
+        if current_git_branch(ctx.project, ctx.run_id) is not None:
+            return ""
+    except ValueError as exc:
+        return str(exc)
+    cfg = _repo_link(ctx.project)
+    if bool(cfg.get("read_only", False)):
+        return "project repo is read_only in repo_link.yaml"
+    return ""
+
+
+def _patch_result_payload(
+    ctx: ToolContext,
+    version: str,
+    *,
+    applied: bool,
+    error: str | None = None,
+    command_result: dict[str, Any] | None = None,
+    files: list[str] | None = None,
+    repo_root: Path | None = None,
+    rollback_ref: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema": "patch_apply_result.v1",
+        "run_id": ctx.run_id,
+        "project": ctx.project,
+        "agent": ctx.agent,
+        "version": version,
+        "applied": applied,
+        "mode": "git_apply",
+        "repo_root": str(repo_root) if repo_root is not None else "",
+        "files": files or [],
+        "error": error,
+        "command_result": command_result,
+        "rollback_ref": rollback_ref,
+        "created": datetime.now(tz=timezone.utc).isoformat(),
+    }
+
+
+def _write_patch_result(ctx: ToolContext, version: str, payload: dict[str, Any]) -> None:
+    run_root = Path(str(ctx.extra.get("run_root"))) if ctx.extra.get("run_root") else repo_root() / "runs" / ctx.run_id
+    if not ctx.run_id:
+        return
+    target = run_root / "coding" / f"patch.{version}.approved.json"
+    scope = current_project_scope(ctx.project, ctx.run_id)
+    if scope is not None:
+        target = scope.run_file(f"coding/patch.{version}.approved.json")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def _project_root(ctx: ToolContext) -> Path | None:
+    scope = current_project_scope(ctx.project, ctx.run_id)
+    if scope is not None:
+        return scope.candidate_root
+    from app.harness.tools.git_branch import current_git_branch
+    branch = current_git_branch(ctx.project, ctx.run_id)
+    if branch is not None:
+        from app.harness.tools.project_repo import load_project_repo
+        return load_project_repo(ctx.project).root
+    raw = ctx.project_repo_root or str(ctx.extra.get("project_repo_root", "") if ctx.extra else "")
+    if raw:
+        candidate = Path(raw).expanduser().resolve()
+        return candidate if candidate.exists() else None
+    cfg = _repo_link(ctx.project)
+    repo_path = str(cfg.get("repo_path") or cfg.get("local_path") or "").strip()
+    if not repo_path:
+        return None
+    raw_path = Path(repo_path)
+    if raw_path.is_absolute():
+        candidate = raw_path.resolve()
+    else:
+        candidate = (project_root(ctx.project) / raw_path).resolve()
+    return candidate if candidate.exists() else None
+
+
+def _resolve_project_file(
+    ctx: ToolContext,
+    path: str,
+    *,
+    must_exist: bool,
+    for_write: bool = False,
+) -> tuple[Path, str, Path] | ToolResult:
+    try:
+        scope = current_project_scope(ctx.project, ctx.run_id)
+        if scope is not None:
+            target = scope.resolve_file(path, write=for_write, must_exist=must_exist)
+            return scope.candidate_root, target.relative_to(scope.candidate_root).as_posix(), target
+        from app.harness.tools.git_branch import current_git_branch
+        if current_git_branch(ctx.project, ctx.run_id) is not None:
+            from app.harness.tools.project_repo import load_project_repo, resolve_allowed_path
+            repo = load_project_repo(ctx.project)
+            target = resolve_allowed_path(repo, path, require_exists=must_exist, for_write=for_write)
+            return repo.root, target.relative_to(repo.root).as_posix(), target
+    except ValueError as exc:
+        return ToolResult(ok=False, error=str(exc))
+    root = _project_root(ctx)
+    if root is None:
+        return ToolResult(ok=False, error=f"project repo for '{ctx.project}' is not connected")
+    rel = Path(path)
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        return ToolResult(ok=False, error="invalid project-relative path")
+    rel_posix = rel.as_posix()
+    if _is_ignored_path(ctx.project, rel_posix):
+        return ToolResult(ok=False, error=f"path '{rel_posix}' is ignored by repo_link.yaml")
+    if not _is_allowed_path(ctx.project, rel_posix):
+        return ToolResult(ok=False, error=f"path '{rel_posix}' is outside allowed_paths")
+    target = (root / rel).resolve()
+    if not _is_relative_to(target, root.resolve()):
+        return ToolResult(ok=False, error=f"path '{rel_posix}' escapes project repo")
+    if must_exist and not target.is_file():
+        return ToolResult(ok=False, error=f"file not found: {rel_posix}")
+    return root, rel_posix, target
+
+
+def _repo_link(project: str) -> dict[str, Any]:
+    path = project_root(project) / "repo_link.yaml"
+    if not path.exists():
+        return {}
+    raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _is_allowed_path(project: str, rel: str) -> bool:
+    allowed_raw = _repo_link(project).get("allowed_paths", [])
+    if not isinstance(allowed_raw, list) or not allowed_raw:
+        return True
+    for item in allowed_raw:
+        pattern = str(item).strip()
+        if not pattern:
+            continue
+        if pattern.endswith("/"):
+            if rel.startswith(pattern):
+                return True
+        elif rel == pattern or rel.startswith(pattern.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def _is_ignored_path(project: str, rel: str) -> bool:
+    ignored_raw = _repo_link(project).get("ignore_patterns", [])
+    if not isinstance(ignored_raw, list):
+        return False
+    for item in ignored_raw:
+        pattern = str(item).strip()
+        if not pattern:
+            continue
+        if pattern.endswith("/"):
+            if rel.startswith(pattern):
+                return True
+            continue
+        if fnmatch.fnmatch(rel, pattern):
+            return True
+    return False
+
+
+def _snapshot(rel: str, target: Path) -> FileSnapshot:
+    if not target.exists():
+        return FileSnapshot(path=rel, existed=False, sha256="", content="")
+    return FileSnapshot.capture(rel, target.read_bytes())
+
+
+def _record_branch_write(ctx: ToolContext, files: list[str]) -> None:
+    from app.harness.tools.git_branch import record_changed_files
+    record_changed_files(ctx.project, ctx.run_id, files)
+
+
+def _write_rollback(ctx: ToolContext, tool_name: str, snapshots: list[FileSnapshot], *,
+                    after_snapshots: list[FileSnapshot] | None = None) -> str | None:
+    run_root = Path(str(ctx.extra.get("run_root"))) if ctx.extra.get("run_root") else repo_root() / "runs" / ctx.run_id
+    scope = current_project_scope(ctx.project, ctx.run_id)
+    if scope is not None:
+        run_root = scope.run_root
+    if not ctx.run_id or not run_root.exists():
+        return None
+    target_dir = run_root / "coding" / "tool_applications"
+    name = f"rollback_{uuid.uuid4().hex}.json"
+    target = scope.run_file(f"coding/tool_applications/{name}") if scope else target_dir / name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": "tool_rollback.v1",
+        "tool": tool_name,
+        "run_id": ctx.run_id,
+        "project": ctx.project,
+        "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        "snapshots": [asdict(item) for item in snapshots],
+        "text_mode": "utf8_exact",
+    }
+    if after_snapshots is not None:
+        payload["after_snapshots"] = [asdict(item) for item in after_snapshots]
+    atomic_write_text(target, json.dumps(payload, ensure_ascii=False, indent=2))
+    return str(target)
+
+
+def _extract_diff_paths(diff: str) -> list[str]:
+    out: list[str] = []
+    for match in re.finditer(r"^\+\+\+\s+b/(.+)$", diff, flags=re.MULTILINE):
+        path = match.group(1).strip()
+        if path != "/dev/null":
+            out.append(path)
+    for match in re.finditer(r"^---\s+a/(.+)$", diff, flags=re.MULTILINE):
+        path = match.group(1).strip()
+        if path != "/dev/null" and path not in out:
+            out.append(path)
+    return out
+
+
+def _sha_text(text: str) -> str:
+    return "sha256:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _bound_diff_error(ctx: ToolContext, diff: str) -> str:
+    try:
+        scope = current_project_scope(ctx.project, ctx.run_id)
+        if scope is not None:
+            for path in validated_diff_paths(diff):
+                scope.resolve_file(path, write=True)
+        else:
+            from app.harness.tools.git_branch import current_git_branch
+            if current_git_branch(ctx.project, ctx.run_id) is not None:
+                for path in validated_diff_paths(diff):
+                    resolved = _resolve_project_file(ctx, path, must_exist=False, for_write=True)
+                    if isinstance(resolved, ToolResult):
+                        return str(resolved.error)
+    except ValueError as exc:
+        return str(exc)
+    return ""
+
+
+def _bound_rollback(ctx: ToolContext, rollback_ref: str) -> ToolResult:
+    scope = current_project_scope(ctx.project, ctx.run_id)
+    assert scope is not None
+    try:
+        given = Path(rollback_ref)
+        relative = given.relative_to(scope.run_root).as_posix() if given.is_absolute() else rollback_ref
+        if not relative.startswith("coding/tool_applications/"):
+            raise ValueError("Rollback must be an artifact of this run")
+        path = scope.run_file(relative, must_exist=True)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if (not isinstance(data, dict) or data.get("schema") != "tool_rollback.v1"
+                or data.get("run_id") != ctx.run_id or data.get("project") != ctx.project
+                or not isinstance(data.get("snapshots"), list) or not data["snapshots"]):
+            raise ValueError("Rollback identity or snapshot is invalid")
+        validated: list[tuple[str, Path, FileContent]] = []
+        for item in data["snapshots"]:
+            if (not isinstance(item, dict) or not isinstance(item.get("path"), str)
+                    or type(item.get("existed")) is not bool or not isinstance(item.get("content"), str)):
+                raise ValueError("Rollback snapshot is malformed")
+            content = snapshot_content(item)
+            target = scope.resolve_file(item["path"], write=True)
+            validated.append((item["path"], target, content))
+        # Validate every target before writing any; a protected final entry must
+        # not partially apply earlier permitted entries.
+        if not ctx.dry_run:
+            for _name, target, content in validated:
+                if content is not None:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if isinstance(content, bytes):
+                        atomic_write_bytes(target, content)
+                    else:
+                        atomic_write_text(target, content,
+                            newline='' if data.get('text_mode') == 'utf8_exact' else None)
+                elif target.exists():
+                    target.unlink()
+        return ToolResult(ok=True, output={"rolled_back": [item[0] for item in validated], "dry_run": ctx.dry_run})
+    except (OSError, ValueError) as exc:
+        return ToolResult(ok=False, error=str(exc))

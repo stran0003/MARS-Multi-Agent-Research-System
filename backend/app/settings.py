@@ -1,0 +1,294 @@
+"""Centralized real-only settings; missing services never produce sample results."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Literal, Mapping
+
+from pydantic import Field, SecretStr, PrivateAttr, TypeAdapter
+from pydantic_settings import BaseSettings, SettingsConfigDict
+import yaml
+
+ExecutionBackend = Literal['pim_cpu', 'paper_static', 'local_command', 'docker_command', 'remote_gpu']
+
+def resolve_runtime_root(configured: str, source_root: Path) -> Path:
+    """Select an explicitly seeded desktop workspace without reading source secrets."""
+    if not configured:
+        return source_root
+    root = Path(configured).expanduser()
+    if not root.is_absolute():
+        raise ValueError("MARS_RUNTIME_ROOT must be an absolute application workspace")
+    required = ("configs/agents.yaml", "templates/artifacts", "backend/app/harness/schema/schemas")
+    if not root.is_dir() or any(not (root / path).exists() for path in required):
+        raise ValueError("MARS_RUNTIME_ROOT is missing required application resources")
+    return root.resolve()
+
+
+REPO_ROOT = resolve_runtime_root(
+    os.environ.get("MARS_RUNTIME_ROOT", ""), Path(__file__).resolve().parents[2]
+)
+LOCAL_ENV_FILES = (REPO_ROOT / ".env", REPO_ROOT / ".env.local")
+
+
+def local_service_defaults() -> tuple[str, int, int]:
+    """Share source defaults with the frontend; explicit environment wins."""
+    raw = yaml.safe_load((REPO_ROOT / "configs/local_runtime.yaml").read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not isinstance(raw.get("host"), str):
+        raise ValueError("Invalid local runtime configuration")
+    for field_name in ("backend_port", "frontend_port"):
+        value = raw.get(field_name)
+        if type(value) is not int or not 1 <= value <= 65535:
+            raise ValueError("Invalid local runtime port")
+    return raw["host"], raw["backend_port"], raw["frontend_port"]
+
+
+_LOCAL_HOST, _LOCAL_BACKEND_PORT, _LOCAL_FRONTEND_PORT = local_service_defaults()
+
+
+def default_source_domains() -> str:
+    """Use the shared research source policy when no environment override exists."""
+    raw = yaml.safe_load((REPO_ROOT / "configs/cli_research.yaml").read_text(encoding="utf-8"))
+    domains = raw.get("source_domains") if isinstance(raw, dict) else None
+    if not isinstance(domains, list) or not domains or any(not isinstance(domain, str) or not domain.strip() for domain in domains):
+        raise ValueError("Research source_domains must contain nonempty domain names")
+    return ",".join(domains)
+
+
+class Settings(BaseSettings):
+    _execution_backend_source: str = PrivateAttr(default='default')
+    model_config = SettingsConfigDict(
+        env_file=tuple(str(path) for path in LOCAL_ENV_FILES),
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+    # === LLM keys (all optional) ===
+    anthropic_api_key: str = ""
+    openai_api_key: str = ""
+    qwen_api_key: str = ""
+    gemini_api_key: str = ""
+    deepseek_api_key: str = ""
+    zhipu_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com/v1"
+
+    # Default empty — local_vllm is "available" only when explicitly configured.
+    local_vllm_base_url: str = ""
+    local_vllm_api_key: str = "EMPTY"
+
+    custom_endpoint_url: str = ""
+    custom_endpoint_api_key: str = ""
+
+    # === Infra ===
+    redis_url: str = "redis://localhost:6379/0"
+    chromadb_path: str = str(REPO_ROOT / "knowledge" / ".chromadb")
+
+    # === Service ===
+    backend_host: str = _LOCAL_HOST
+    backend_port: int = _LOCAL_BACKEND_PORT
+    frontend_port: int = _LOCAL_FRONTEND_PORT
+    mars_cors_origins: str = "*"
+    mars_desktop_session_token: SecretStr = Field(default=SecretStr(""), repr=False)
+
+    # === Mode flags ===
+    mars_runtime_mode: Literal["development", "staging", "production"] = "development"
+    mars_mock_mode: Literal["never"] = "never"
+    mars_graph_engine: Literal["mars_native", "langgraph", "legacy"] = "mars_native"
+    mars_distribution: Literal["v30-core", "v31-wireless"] = "v30-core"
+    mars_project_pack_paths: str = ""
+    mars_execution_backend: Literal[
+        "pim_cpu",
+        "paper_static",
+        "local_command",
+        "docker_command",
+        "remote_gpu",
+    ] = "local_command"
+    mars_execution_device: Literal["cpu", "gpu"] = "cpu"
+    mars_coding_backend: Literal[
+        "native_llm",
+        "zcode",
+        "opencode",
+        "codex",
+        "claude_code",
+    ] = "zcode"
+    mars_log_level: str = "INFO"
+    mars_default_project: str = "pimc"
+    mars_folder_projects_registry: str = ""
+    mars_folder_context_max_chars: int = Field(default=120_000, ge=1000, le=1_000_000)
+    mars_folder_context_max_files: int = Field(default=100, ge=1, le=1000)
+    # Explicit service-start alternative; baseline remains configs/agents.yaml.
+    mars_idea_runtime_profile: Literal["focused_v1", "baseline", "experimental_research_pro_per_insight_v1", "experimental_research_pro_per_insight_v2", "experimental_research_pro_per_insight_v3", "experimental_research_pro_per_insight_v4", "experimental_research_pro_per_insight_v5", "experimental_research_pro_per_insight_v6"] = "focused_v1"
+    mars_llm_timeout_seconds: float = 720.0
+    mars_enable_network_tools: bool = True
+    mars_source_max_mib: int = Field(default=12, ge=1, le=64)
+    mars_source_connect_timeout_seconds: float = Field(default=15, ge=1, le=60)
+    mars_source_read_timeout_seconds: float = Field(default=30, ge=1, le=120)
+    mars_source_download_timeout_seconds: float = Field(default=180, ge=1, le=240)
+    mars_source_total_timeout_seconds: float = Field(default=240, ge=1, le=300)
+    mars_source_max_attempts: int = Field(default=2, ge=1, le=5)
+    # CVF metadata only; connection/read waits also obey the source limits above.
+    mars_cvf_total_timeout_seconds: float = Field(default=60, ge=1, le=180)
+    mars_cvf_directory_max_mib: int = Field(default=8, ge=1, le=16)
+    mars_cvf_landing_max_kib: int = Field(default=256, ge=1, le=1024)
+    mars_neurips_total_timeout_seconds: float = Field(default=60, ge=1, le=180)
+    mars_neurips_directory_max_mib: int = Field(default=8, ge=1, le=16)
+    mars_neurips_landing_max_kib: int = Field(default=256, ge=1, le=1024)
+    mars_web_search_allowlist: str = Field(default_factory=default_source_domains)
+    mars_web_search_provider: Literal["", "brave", "tavily", "serper", "zhipu"] = ""
+    brave_search_api_key: str = ""
+    tavily_api_key: str = ""
+    serper_api_key: str = ""
+    mars_context_max_tokens: int = 32_000
+    mars_context_target_tokens: int = 24_000
+    mars_context_auto_compress: bool = True
+    mars_context_memory_injection: bool = True
+    mars_context_tool_raw_externalize: bool = True
+    mars_context_workbench_enabled: bool = True
+
+    # === Optional observability sinks ===
+    # LangSmith is an external mirror only; file-backed traces remain mandatory.
+    mars_langsmith_enabled: bool = False
+    langsmith_api_key: str = ""
+    langsmith_endpoint: str = "https://api.smith.langchain.com"
+    langsmith_project: str = "mars-dev"
+    mars_langsmith_timeout_ms: int = 1000
+
+    @property
+    def is_production(self) -> bool:
+        return self.mars_runtime_mode == "production"
+
+    @property
+    def mock_allowed(self) -> bool:
+        return False
+
+    @property
+    def effective_execution_device(self) -> Literal["cpu", "gpu"]:
+        """Resolve the new device switch while preserving the legacy GPU alias."""
+
+        if "mars_execution_device" in self.model_fields_set:
+            return self.mars_execution_device
+        if self.mars_execution_backend == "remote_gpu":
+            return "gpu"
+        return self.mars_execution_device
+
+    @property
+    def execution_device_source(self) -> Literal["explicit", "legacy_backend", "default"]:
+        if "mars_execution_device" in self.model_fields_set:
+            return "explicit"
+        if self.mars_execution_backend == "remote_gpu":
+            return "legacy_backend"
+        return "default"
+
+    @property
+    def execution_backend_source(self) -> str:
+        return self._execution_backend_source
+
+    @property
+    def cors_origins(self) -> list[str]:
+        raw = self.mars_cors_origins.strip()
+        if not raw or raw == "*":
+            return ["*"]
+        return [origin.strip() for origin in raw.split(",") if origin.strip()]
+
+    @property
+    def project_pack_roots(self) -> tuple[Path, ...]:
+        """Return deterministic Project Pack roots.
+
+        The repository ``projects`` directory is the public default. Optional
+        overlays are mounted explicitly through ``MARS_PROJECT_PACK_PATHS``
+        using the platform path separator; no package auto-discovery is used.
+        """
+
+        roots = [REPO_ROOT / "projects"]
+        roots.extend(
+            Path(item).expanduser()
+            for item in self.mars_project_pack_paths.split(os.pathsep)
+            if item.strip()
+        )
+        return tuple(roots)
+
+
+_settings: Settings | None = None
+
+
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        selected = Settings()
+        if 'mars_execution_backend' in selected.model_fields_set:
+            selected._execution_backend_source = 'environment'
+        else:
+            import yaml
+            configured = env_or_local('MARS_EXECUTION_CONFIG_PATH')
+            path = Path(configured).expanduser() if configured else REPO_ROOT / 'configs/execution.yaml'
+            if not path.is_absolute():
+                path = REPO_ROOT / path
+            raw = yaml.safe_load(path.read_text()) if path.is_file() else {}
+            execution = raw.get('execution', {}) if isinstance(raw, dict) else {}
+            if isinstance(execution, dict) and execution.get('backend') is not None:
+                selected.mars_execution_backend = TypeAdapter(ExecutionBackend).validate_python(execution['backend'])
+                selected._execution_backend_source = 'execution_config'
+        _settings = selected
+    return _settings
+
+
+def reset_settings_cache() -> None:
+    global _settings
+    _settings = None
+
+
+def local_env_files() -> tuple[Path, ...]:
+    return LOCAL_ENV_FILES
+
+
+def read_local_env_vars() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for path in LOCAL_ENV_FILES:
+        if not path.is_file():
+            continue
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            parsed = _parse_env_line(raw_line)
+            if parsed is None:
+                continue
+            key, value = parsed
+            values[key] = value
+    return values
+
+
+def env_or_local(name: str) -> str:
+    key = name.strip()
+    if not key:
+        return ""
+    runtime_value = os.environ.get(key)
+    if runtime_value is not None:
+        return runtime_value
+    return read_local_env_vars().get(key, "")
+
+
+def set_runtime_env(values: Mapping[str, str]) -> None:
+    for key, value in values.items():
+        if key:
+            os.environ[key] = value
+    reset_settings_cache()
+
+
+def repo_root() -> Path:
+    return REPO_ROOT
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#") or "=" not in stripped:
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :].strip()
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    if not key:
+        return None
+    return key, _strip_env_value(value.strip())
+
+
+def _strip_env_value(value: str) -> str:
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value

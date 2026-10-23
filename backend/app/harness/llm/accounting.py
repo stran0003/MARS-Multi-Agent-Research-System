@@ -1,0 +1,647 @@
+"""Shared, durable pre-call reservations for a run and all inherited child tasks.
+
+Unknown usage retains its reservation. A lost response never becomes zero cost.
+Amounts are conservative bounds, not estimates of the provider's final invoice.
+"""
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+import hashlib
+import json
+import math
+from pathlib import Path
+import time
+from typing import Any
+import uuid
+
+import yaml
+from filelock import BaseFileLock, FileLock, Timeout as FileLockTimeout
+
+from app.harness.llm.provider_base import (
+    Completion, LLMConfig, LLMProvider, Message, MAX_LLM_RETRIES, llm_call_deadline_seconds,
+)
+from app.harness.persistence import atomic_write_json, path_lock
+from app.settings import repo_root
+from app.harness.llm.usage_policy import TokenUsageMode, token_usage_mode
+
+_COMPLETION_DRIVEN: ContextVar[bool] = ContextVar("mars_completion_driven", default=False)
+_RUN_ROOT: ContextVar[Path | None] = ContextVar("mars_model_budget_root", default=None)
+
+
+class ResourceBudgetError(RuntimeError):
+    """No model request was sent because the run's hard limit was reached."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.reason = {"code": "resource_budget_blocked", "request_sent": False}
+
+
+class ModelConcurrencyBusy(ResourceBudgetError):
+    pass
+
+
+class ResourceReconciliationRequired(ResourceBudgetError):
+    """A vanished owner left an unknown request; no automatic replay is allowed."""
+
+
+def require_accounted_model_backend(backend: str) -> None:
+    """External model processes cannot promise this host's per-call hard limits."""
+    if _RUN_ROOT.get() is not None:
+        raise ResourceBudgetError(f"{backend} has no enforceable shared model budget adapter; use native_llm for governed runs")
+
+
+@contextmanager
+def run_resource_scope(run_root: Path, *, completion_driven: bool = False) -> Iterator[None]:
+    # Nested Discovery/Agent work must share its ancestor's quota.
+    token = _RUN_ROOT.set(_RUN_ROOT.get() or run_root.resolve())
+    mode_token = _COMPLETION_DRIVEN.set(completion_driven)
+    try:
+        yield
+    finally:
+        _RUN_ROOT.reset(token)
+        _COMPLETION_DRIVEN.reset(mode_token)
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+
+
+def _number(value: Any, name: str, *, positive: bool = False) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result) or result < 0 or (positive and result == 0):
+        raise ValueError(f"invalid {name}")
+    return result
+
+
+@dataclass(frozen=True)
+class Reservation:
+    request_id: str
+    tokens: int
+    cost: float | None
+    attempts: int
+    deadline_at: float | None = None
+
+
+def reserved_model_attempts(row: Mapping[str, Any]) -> int:
+    """Read the original conservative attempt reservation, including legacy v1."""
+    maximum = row.get("max_sdk_attempts", MAX_LLM_RETRIES + 1)
+    if type(maximum) is not int or not 1 <= maximum <= MAX_LLM_RETRIES + 1:
+        raise ResourceBudgetError("invalid model-attempt reservation record")
+    return int(maximum)
+
+
+def charged_model_attempts(row: Mapping[str, Any]) -> int:
+    """Read attempt quota charges; absent legacy charges retain the full ceiling."""
+    maximum = reserved_model_attempts(row)
+    charged = row.get("charged_attempts", maximum)
+    if (type(charged) is not int or not 1 <= charged <= maximum
+            or charged < maximum and row.get("attempts_complete") is not True):
+        raise ResourceBudgetError("invalid model-attempt reservation record")
+    return int(charged)
+
+
+@dataclass(frozen=True)
+class ModelRequestCapacity:
+    used: int
+    limit: int | None
+    required: int
+
+    @property
+    def available(self) -> bool:
+        return self.limit is None or self.used + self.required <= self.limit
+
+    def require(self) -> None:
+        if not self.available:
+            raise ResourceBudgetError("run model-request budget cannot reserve all SDK attempts "
+                f"(used={self.used}, limit={self.limit}, required={self.required})")
+
+
+def model_request_capacity(state: Mapping[str, Any], max_retries: int) -> ModelRequestCapacity:
+    """Use remaining quota to bound retries without increasing the hard limit."""
+    if type(max_retries) is not int:
+        raise ValueError("max_retries must be an integer")
+    used = sum(charged_model_attempts(row) for row in state["requests"].values())
+    limit = state["configuration"]["limits"]["max_model_requests"]
+    required = min(max(max_retries, 0), MAX_LLM_RETRIES) + 1
+    if limit is not None:
+        # A remaining slot can fund a request even when the full retry policy
+        # cannot fit. With no slots left, require() must still reject the call.
+        required = min(required, max(1, limit - used))
+    return ModelRequestCapacity(
+        used=used, limit=limit, required=required,
+    )
+
+
+def charged_token_component(row: Mapping[str, Any], component: str) -> int:
+    """Legacy rows retain their entire total in each unknown token bucket."""
+    if component not in {"input", "output"}:
+        raise ValueError("unknown token component")
+    value = row.get(f"charged_{component}_tokens", row.get("charged_tokens"))
+    if type(value) is not int or value < 0:
+        raise ResourceBudgetError("invalid token-component reservation record")
+    return int(value)
+
+
+def validate_token_components(row: Mapping[str, Any]) -> None:
+    if type(row.get("charged_tokens")) is not int or row["charged_tokens"] < 0:
+        raise ResourceBudgetError("invalid total-token reservation record")
+    for component in ("input", "output"):
+        charged_token_component(row, component)
+    present = [f"charged_{component}_tokens" in row for component in ("input", "output")]
+    if any(present) and (not all(present) or
+            charged_token_component(row, "input") + charged_token_component(row, "output") != row.get("charged_tokens")):
+        raise ResourceBudgetError("inconsistent token-component reservation record")
+
+
+class RunModelBudget:
+    def __init__(self, root: Path, *, configuration: Mapping[str, Any] | None = None,
+                 active_model_time: bool = False, completion_driven: bool | None = None,
+                 token_mode: TokenUsageMode | None = None) -> None:
+        self.token_mode = token_mode or token_usage_mode()
+        self.completion_driven = _COMPLETION_DRIVEN.get() if completion_driven is None else completion_driven
+        self.active_model_time = active_model_time
+        self.root = root.resolve()
+        self.path = self.root / "resources" / "model_budget.v1.json"
+        self.lock_path = self.path.with_name("." + self.path.name + ".lock")
+        if configuration is None:
+            # A host-authored per-run policy permits a bounded, explicitly
+            # requested retry without increasing the defaults for other runs.
+            # Existing ledgers still require begin_revision before accepting
+            # a different policy; historical charges are never reset.
+            override = self.root / "resources/model_budget.policy.yaml"
+            if override.is_symlink():
+                raise ResourceBudgetError("run resource policy cannot be a symlink")
+            policy_path = override if override.is_file() else repo_root() / "configs/resources.yaml"
+            raw = yaml.safe_load(policy_path.read_text())
+        else:
+            raw = dict(configuration)
+        if not isinstance(raw, dict) or raw.get("schema") != "runtime.resources.v1":
+            raise ValueError("invalid resources configuration")
+        limits = raw.get("limits", {})
+        if not isinstance(limits, dict):
+            raise ValueError("resource limits must be an object")
+        for key in ("max_model_requests", "max_total_tokens", "max_parallel_model_calls"):
+            if key == "max_model_requests" and key in limits and limits[key] is None:
+                continue
+            if type(limits.get(key)) is not int or limits[key] < 1:
+                raise ValueError(f"{key} must be a positive integer")
+        for key in ("max_input_tokens", "max_billed_output_tokens"):
+            if key in limits and (type(limits[key]) is not int or limits[key] < 1):
+                raise ValueError(f"{key} must be a positive integer when configured")
+        _number(limits.get("max_elapsed_seconds"), "max_elapsed_seconds", positive=True)
+        if limits.get("max_cost") is not None:
+            _number(limits["max_cost"], "max_cost", positive=True)
+        if not isinstance(raw.get("prices", {}), dict):
+            raise ValueError("prices must be an object")
+        self.configuration = json.loads(_canonical(raw))
+        self.configuration_hash = hashlib.sha256(_canonical(raw).encode()).hexdigest()
+        self._leases: dict[str, BaseFileLock] = {}
+
+    def _read(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return {"schema": "runtime.model_budget.v1", "configuration": self.configuration,
+                    "configuration_sha256": self.configuration_hash, "started_at": time.time(), "requests": {}}
+        state: dict[str, Any] = json.loads(self.path.read_text())
+        if (not isinstance(state, dict) or state.get("schema") != "runtime.model_budget.v1"
+                or not isinstance(state.get("configuration"), dict)
+                or not isinstance(state.get("requests"), dict)):
+            raise ResourceBudgetError("invalid resource ledger; reconcile its persisted records")
+        if hashlib.sha256(_canonical(state["configuration"]).encode()).hexdigest() != state.get("configuration_sha256"):
+            raise ResourceBudgetError("resource ledger configuration is corrupt")
+        if state.get("configuration_sha256") != self.configuration_hash:
+            raise ResourceBudgetError("resource policy changed; reconcile the existing run before continuing")
+        _number(state.get("started_at"), "resource ledger start time")
+        if "revision_started_at" in state:
+            _number(state["revision_started_at"], "resource revision start time")
+        for identifier, row in state["requests"].items():
+            if (not isinstance(identifier, str) or not identifier.isalnum() or not isinstance(row, dict)
+                    or row.get("status") not in {"in_flight", "completed", "failed", "cancelled",
+                                                "reconciliation_required", "abandoned"}
+                    or type(row.get("charged_tokens")) is not int or row["charged_tokens"] < 0):
+                raise ResourceBudgetError("invalid resource reservation record")
+            charged_model_attempts(row)
+            validate_token_components(row)
+            if row.get("charged_cost") is not None:
+                _number(row["charged_cost"], "charged model cost")
+            if "local_call_deadline_at" in row or "local_call_deadline_seconds" in row:
+                started = _number(row.get("started_at"), "request start time")
+                deadline = _number(row.get("local_call_deadline_at"), "request local deadline")
+                interval = _number(row.get("local_call_deadline_seconds"), "request deadline interval", positive=True)
+                if deadline < started or not math.isclose(deadline - started, interval, abs_tol=1e-6):
+                    raise ResourceBudgetError("invalid request local deadline")
+        return state
+
+    def recovery_snapshot(self) -> dict[str, Any]:
+        """Validate persisted accounting without reconciling or refunding requests."""
+        with path_lock(self.lock_path):
+            return self._read()
+
+    def remaining_seconds(self) -> float:
+        with path_lock(self.lock_path):
+            return self._remaining_seconds(self._read(), time.time())
+
+    def _remaining_seconds(self, state: dict[str, Any], now: float) -> float:
+        # Completion-driven controls local loop counters only. All roles and
+        # inherited tasks obey the same durable run limits, including Coding.
+        limit = float(state['configuration']['limits']['max_elapsed_seconds'])
+        if not self.active_model_time:
+            start = _number(state.get('revision_started_at', state['started_at']), 'budget start time')
+            return max(0.0, limit - (now - start))
+        # Conversations survive overnight. Charge actual model request durations
+        # across all turns, including failed/cancelled calls, not human idle time.
+        # Legacy ledgers already contain these timestamps; no quota is reset.
+        elapsed = 0.0
+        for row in state['requests'].values():
+            start = _number(row.get('started_at'), 'request start time')
+            end = _number(row.get('finished_at', row.get('owner_lost_at', now)), 'request end time')
+            # Only new calls with an enforced, persisted local deadline can
+            # exclude the time between process death and a later restart.
+            # Legacy calls retain their original conservative activity charge.
+            if (row.get('status') in {'reconciliation_required', 'abandoned'}
+                    and row.get('local_call_deadline_at') is not None):
+                deadline = _number(row['local_call_deadline_at'], 'request local deadline')
+                if deadline < start:
+                    raise ResourceBudgetError('invalid request local deadline')
+                end = min(end, deadline)
+            if end < start:
+                raise ResourceBudgetError('invalid request time interval')
+            elapsed += end - start
+        return max(0.0, limit - elapsed)
+
+    def begin_revision(self, *, invocation_id: str, reason: str) -> None:
+        """Record an explicit fresh execution without refunding previous usage.
+
+        Only the elapsed-time window is renewed. Request/token/cost totals still
+        include every old reservation, including cancelled or unknown usage.
+        Policy changes are archived and are never admitted during a live call.
+        """
+        if not invocation_id.replace("-", "").isalnum() or not reason.strip():
+            raise ValueError("resource revision requires an invocation ID and reason")
+        with path_lock(self.lock_path):
+            if self.path.exists():
+                raw = json.loads(self.path.read_text())
+                if not isinstance(raw, dict) or not isinstance(raw.get("configuration"), dict):
+                    raise ResourceBudgetError("invalid resource ledger; reconcile its persisted records")
+                previous = RunModelBudget(self.root, configuration=raw["configuration"])
+                state = previous._read()
+            else:
+                state = self._read()
+            revisions = state.setdefault("revisions", [])
+            for receipt in revisions:
+                if receipt["invocation_id"] == invocation_id:
+                    if (receipt["reason"] != reason or receipt["configuration_sha256"] != self.configuration_hash
+                            or state["configuration_sha256"] != self.configuration_hash):
+                        raise ResourceBudgetError("resource revision receipt is immutable")
+                    return
+            if self._mark_abandoned(state):
+                atomic_write_json(self.path, state)
+            rows = state["requests"].values()
+            if any(row["status"] == "reconciliation_required" for row in rows):
+                raise ResourceReconciliationRequired("unknown model requests require explicit reconciliation before retry")
+            if any(row["status"] == "in_flight" for row in rows):
+                raise ResourceBudgetError("cannot start a resource revision while model calls are active")
+            if any(row.get("correlation", {}).get("invocation_id") == invocation_id for row in rows):
+                raise ResourceBudgetError("resource revision requires a fresh invocation")
+            if state["configuration"].get("currency") != self.configuration.get("currency"):
+                raise ResourceBudgetError("cannot change currency in an existing resource ledger")
+            started_at = time.time()
+            revisions.append({"invocation_id": invocation_id, "reason": reason, "started_at": started_at,
+                "previous_configuration": state["configuration"],
+                "previous_configuration_sha256": state["configuration_sha256"],
+                "previous_started_at": state.get("revision_started_at", state["started_at"]),
+                "configuration_sha256": self.configuration_hash})
+            state.update(configuration=self.configuration, configuration_sha256=self.configuration_hash,
+                         revision_started_at=started_at)
+            atomic_write_json(self.path, state)
+
+    def change_request_limit(self, *, actor: str, reason: str) -> None:
+        """Apply an authorized request-limit change without renewing time or usage.
+
+        The new configuration must differ solely in max_model_requests. This is
+        a policy update, not a retry, provider reconciliation or quota refund.
+        """
+        if not actor.strip() or not reason.strip():
+            raise ValueError("request-limit change requires actor and reason")
+        with path_lock(self.lock_path):
+            raw = json.loads(self.path.read_text())
+            previous = RunModelBudget(self.root, configuration=raw["configuration"])
+            state = previous._read()
+            if state["configuration_sha256"] == self.configuration_hash:
+                return
+            expected = json.loads(_canonical(state["configuration"]))
+            expected["limits"]["max_model_requests"] = self.configuration["limits"]["max_model_requests"]
+            if _canonical(expected) != _canonical(self.configuration):
+                raise ResourceBudgetError("request-limit change cannot modify other resource limits")
+            if any(row["status"] in {"in_flight", "reconciliation_required"}
+                   for row in state["requests"].values()):
+                raise ResourceBudgetError("cannot change request limit while model requests are active or unresolved")
+            state.setdefault("policy_changes", []).append({
+                "kind": "model_request_limit", "actor": actor, "reason": reason,
+                "timestamp": time.time(), "previous_configuration": state["configuration"],
+                "previous_configuration_sha256": state["configuration_sha256"],
+                "configuration_sha256": self.configuration_hash})
+            state.update(configuration=self.configuration, configuration_sha256=self.configuration_hash)
+            atomic_write_json(self.path, state)
+
+    def _lease_path(self, request_id: str) -> Path:
+        return self.path.parent / "requests" / f"{request_id}.lock"
+
+    def _mark_abandoned(self, state: dict[str, Any], *, request_ids: set[str] | None = None) -> bool:
+        changed = False
+        for identifier, row in state["requests"].items():
+            if request_ids is not None and identifier not in request_ids:
+                continue
+            if row["status"] != "in_flight":
+                continue
+            lease_path = self._lease_path(identifier)
+            lease_path.parent.mkdir(parents=True, exist_ok=True)
+            probe = FileLock(lease_path, timeout=0)
+            try:
+                probe.acquire()
+            except FileLockTimeout:
+                continue
+            try:
+                row.update(status="reconciliation_required", usage_complete=False,
+                           owner_lost_at=time.time(), recovery_reason="owner lease is no longer held")
+                changed = True
+            finally:
+                probe.release()
+        return changed
+
+    def recover_abandoned(self, *, request_ids: tuple[str, ...] | None = None) -> tuple[str, ...]:
+        """Expose orphaned requests without inventing usage or replaying them."""
+        with path_lock(self.lock_path):
+            state = self._read()
+            selected = set(request_ids) if request_ids is not None else None
+            if self._mark_abandoned(state, request_ids=selected):
+                atomic_write_json(self.path, state)
+            return tuple(key for key, row in state["requests"].items()
+                         if row["status"] == "reconciliation_required" and (selected is None or key in selected))
+
+    def reconcile_abandoned(self, request_id: str, *, actor: str, reason: str,
+                            evidence_refs: tuple[str, ...]) -> None:
+        """Acknowledge an unknown outcome; retain its full reserved token/cost.
+
+        This operation never resends a request or declares provider success.
+        Independent work may proceed afterwards within the remaining budget.
+        """
+        if not actor.strip() or not reason.strip() or not evidence_refs or any(not ref.strip() for ref in evidence_refs):
+            raise ValueError("reconciliation requires actor, reason and evidence references")
+        with path_lock(self.lock_path):
+            state = self._read()
+            self._mark_abandoned(state, request_ids={request_id})
+            row = state["requests"].get(request_id)
+            if row is None or row["status"] not in {"reconciliation_required", "abandoned"}:
+                raise ResourceBudgetError("only an abandoned reservation can be reconciled")
+            receipt = {"actor": actor, "reason": reason, "evidence_refs": list(evidence_refs)}
+            if row["status"] == "abandoned":
+                if row.get("reconciliation") != receipt:
+                    raise ResourceBudgetError("reservation reconciliation is immutable")
+                return
+            # Probe again even for an earlier reconciliation_required marker.
+            # An acknowledgement cannot take over a lease still held by a live owner.
+            lease_path = self._lease_path(request_id)
+            lease_path.parent.mkdir(parents=True, exist_ok=True)
+            probe = FileLock(lease_path, timeout=0)
+            try:
+                probe.acquire()
+            except FileLockTimeout as exc:
+                raise ResourceBudgetError("model request owner lease is still held") from exc
+            try:
+                row.update(status="abandoned", reconciled_at=time.time(), reconciliation=receipt,
+                           usage_complete=False)
+                atomic_write_json(self.path, state)
+            finally:
+                probe.release()
+
+    def reserve(self, messages: list[Message], config: LLMConfig,
+                correlation: Mapping[str, Any], *, local_deadline_seconds: float | None = None) -> Reservation:
+        if type(config.max_tokens) is not int or config.max_tokens < 1:
+            raise ValueError("max_tokens must bound a positive output length")
+        if type(config.max_retries) is not int:
+            raise ValueError("max_retries must be an integer")
+        if local_deadline_seconds is not None:
+            _number(local_deadline_seconds, 'enforced local model deadline', positive=True)
+        prompt_bound = len(_canonical({"messages": [m.to_wire() for m in messages],
+                                      "tools": config.tools}).encode()) + 32 * (len(messages) + 1)
+        price = self.configuration.get("prices", {}).get(config.provider + "/" + config.model)
+        attempt_cost: float | None = None
+        if price is not None:
+            if not isinstance(price, dict):
+                raise ValueError("model price must be an object")
+            input_rate = _number(price.get("input_per_million"), "input price")
+            output_rate = _number(price.get("output_per_million"), "output price")
+            attempt_cost = (prompt_bound * input_rate + config.max_tokens * output_rate) / 1_000_000
+        identifier = uuid.uuid4().hex
+        with path_lock(self.lock_path):
+            state = self._read()
+            if self._mark_abandoned(state):
+                atomic_write_json(self.path, state)
+            unresolved = [key for key, row in state["requests"].items() if row["status"] == "reconciliation_required"]
+            if unresolved:
+                raise ResourceReconciliationRequired("unknown model requests require explicit reconciliation: " + ", ".join(unresolved))
+            limits = state["configuration"]["limits"]
+            if self._remaining_seconds(state, time.time()) <= 0:
+                raise ResourceBudgetError("run elapsed-time budget exhausted")
+            if self.active_model_time:
+                state['elapsed_clock'] = 'cumulative_model_activity'
+            rows = list(state["requests"].values())
+            capacity = model_request_capacity(state, config.max_retries)
+            capacity.require()
+            attempts = capacity.required
+            reserved_tokens = (prompt_bound + config.max_tokens) * attempts
+            reserved_input = prompt_bound * attempts
+            reserved_output = config.max_tokens * attempts
+            cost = attempt_cost * attempts if attempt_cost is not None else None
+            if self.token_mode == 'limited' and sum(row["charged_tokens"] for row in rows) + reserved_tokens > limits["max_total_tokens"]:
+                raise ResourceBudgetError("run total-token reservation exceeds remaining budget")
+            for component, key, amount in (("input", "max_input_tokens", reserved_input),
+                                           ("output", "max_billed_output_tokens", reserved_output)):
+                if self.token_mode == 'limited' and key in limits and sum(charged_token_component(row, component) for row in rows) + amount > limits[key]:
+                    raise ResourceBudgetError(f"run {component}-token reservation exceeds remaining budget")
+            if limits.get("max_cost") is not None:
+                if cost is None or any(row["charged_cost"] is None for row in rows):
+                    raise ResourceBudgetError("monetary limit requires explicit prices for every selected model")
+                if sum(row["charged_cost"] for row in rows) + cost > limits["max_cost"]:
+                    raise ResourceBudgetError("run monetary reservation exceeds remaining budget")
+            if sum(row["status"] == "in_flight" for row in rows) >= limits["max_parallel_model_calls"]:
+                raise ModelConcurrencyBusy("run model concurrency slots are occupied")
+            state["requests"][identifier] = {"status": "in_flight", "started_at": time.time(),
+                "provider": config.provider, "model": config.model, "correlation": dict(correlation),
+                "execution_mode": "completion_driven" if self.completion_driven else "bounded",
+                "token_usage_mode": self.token_mode,
+                "reserved_tokens": reserved_tokens, "charged_tokens": reserved_tokens,
+                "reserved_input_tokens": reserved_input, "charged_input_tokens": reserved_input,
+                "reserved_output_tokens": reserved_output, "charged_output_tokens": reserved_output,
+                "reserved_cost": cost, "charged_cost": cost, "usage": None, "usage_complete": False,
+                "price": price, "max_sdk_attempts": attempts, "charged_attempts": attempts,
+                "observed_attempts": None, "attempts_complete": False}
+            deadline_at = None
+            if local_deadline_seconds is not None:
+                row = state["requests"][identifier]
+                remaining = self._remaining_seconds(state, row['started_at'])
+                if remaining <= 0:
+                    raise ResourceBudgetError("run elapsed-time budget exhausted")
+                deadline_at = row['started_at'] + min(local_deadline_seconds, remaining)
+                row['local_call_deadline_at'] = deadline_at
+                row['local_call_deadline_seconds'] = deadline_at - row['started_at']
+            lease_path = self._lease_path(identifier)
+            lease_path.parent.mkdir(parents=True, exist_ok=True)
+            lease = FileLock(lease_path, timeout=0, thread_local=False)
+            lease.acquire()
+            try:
+                atomic_write_json(self.path, state)
+            except BaseException:
+                lease.release()
+                raise
+            self._leases[identifier] = lease
+        return Reservation(identifier, reserved_tokens, cost, attempts, deadline_at)
+
+    def settle(self, reservation: Reservation, *, usage: Any, complete: bool,
+               outcome: str, sdk_attempts: int | None = None,
+               attempts_complete: bool = False) -> None:
+        if outcome not in {"completed", "failed", "cancelled"}:
+            raise ValueError("invalid model settlement outcome")
+        with path_lock(self.lock_path):
+            state = self._read()
+            row = state["requests"][reservation.request_id]
+            if row["status"] != "in_flight":
+                raise ResourceBudgetError("model reservation already settled")
+            if reservation.request_id not in self._leases:
+                raise ResourceBudgetError("model reservation belongs to another owner; use explicit reconciliation after owner loss")
+            maximum_attempts = row.get("max_sdk_attempts", MAX_LLM_RETRIES + 1)
+            if sdk_attempts is not None and (type(sdk_attempts) is not int
+                    or not 0 <= sdk_attempts <= maximum_attempts):
+                raise ValueError("observed SDK attempts exceed the reservation or are invalid")
+            attempt_count_known = bool(outcome != "cancelled" and attempts_complete
+                                       and sdk_attempts is not None and sdk_attempts > 0)
+            row.update(observed_attempts=sdk_attempts, attempts_complete=attempt_count_known,
+                       charged_attempts=sdk_attempts if attempt_count_known else maximum_attempts)
+            valid = (isinstance(usage, dict)
+                     and all(type(usage.get(k)) is int and usage[k] >= 0
+                             for k in ("prompt_tokens", "completion_tokens", "total_tokens"))
+                     and usage["total_tokens"] >= usage["prompt_tokens"] + usage["completion_tokens"])
+            known = bool(complete and valid)
+            row.update(status=outcome, finished_at=time.time(), usage=usage if valid else None,
+                       usage_complete=known)
+            if known:
+                row["charged_tokens"] = usage["total_tokens"]
+                row["charged_input_tokens"] = usage["prompt_tokens"]
+                # completion_tokens includes billed reasoning for conforming
+                # providers. Any unexplained remainder stays charged as output,
+                # never silently disappears from the separate output ceiling.
+                row["charged_output_tokens"] = usage["total_tokens"] - usage["prompt_tokens"]
+                if row["price"] is not None:
+                    price = row["price"]
+                    row["charged_cost"] = (usage["prompt_tokens"] * price["input_per_million"]
+                        + row["charged_output_tokens"] * price["output_per_million"]) / 1_000_000
+            row["reservation_exceeded"] = known and (row["charged_tokens"] > row["reserved_tokens"]
+                or row["charged_input_tokens"] > row.get("reserved_input_tokens", row["reserved_tokens"])
+                or row["charged_output_tokens"] > row.get("reserved_output_tokens", row["reserved_tokens"]))
+            atomic_write_json(self.path, state)
+            lease = self._leases.pop(reservation.request_id, None)
+            if lease is not None:
+                lease.release()
+
+
+async def guarded_complete(provider: LLMProvider, messages: list[Message], config: LLMConfig,
+                           *, run_root: Path | None = None,
+                           active_model_time: bool = False,
+                           correlation: Mapping[str, Any] | None = None) -> Completion:
+    root = _RUN_ROOT.get() or run_root
+    if root is None:
+        raise ResourceBudgetError("production model calls require a run resource scope")
+    from app.harness.llm.research_accounting import ContractModelBudget, bounded_contract_config
+    from app.harness.runtime.research_execution_scope import current_research_execution
+    scope = current_research_execution(root)
+    budget: RunModelBudget | ContractModelBudget
+    if scope is not None:
+        if not provider.budget_attempts_observable:
+            raise ResourceBudgetError("provider has no verified contract attempt accounting adapter")
+        config = bounded_contract_config(scope, config)
+        budget = ContractModelBudget(scope, endpoint=provider.base_url)
+    else:
+        budget = RunModelBudget(root, active_model_time=active_model_time)
+    while True:
+        try:
+            if isinstance(budget, RunModelBudget):
+                reservation = budget.reserve(messages, config, correlation or {},
+                    local_deadline_seconds=llm_call_deadline_seconds(config))
+            else:
+                reservation = budget.reserve(messages, config, correlation or {})
+            break
+        except ModelConcurrencyBusy:
+            await asyncio.sleep(0.05)
+    observer = config.attempt_observer
+    unknown_attempt = False
+    started_attempts = 0
+    finished_attempts = 0
+    attempt_sequence_valid = True
+
+    def observe(kind: str, data: dict[str, Any]) -> None:
+        nonlocal unknown_attempt, started_attempts, finished_attempts, attempt_sequence_valid
+        if isinstance(budget, ContractModelBudget):
+            budget.observe(reservation, kind, data)
+        if kind == "sdk_attempt_started":
+            number = data.get("attempt")
+            if (type(number) is not int or number != started_attempts + 1
+                    or started_attempts != finished_attempts or number > reservation.attempts):
+                attempt_sequence_valid = False
+                raise ResourceBudgetError("SDK attempt cannot exceed its reserved request budget")
+            started_attempts += 1
+        elif kind in {"sdk_attempt_succeeded", "sdk_attempt_failed"}:
+            number = data.get("attempt")
+            if (type(number) is not int or number != started_attempts
+                    or finished_attempts + 1 != started_attempts):
+                attempt_sequence_valid = False
+            else:
+                finished_attempts += 1
+            if kind == "sdk_attempt_failed":
+                unknown_attempt = True
+        if observer is not None:
+            observer(kind, data)
+
+    def attempts_are_known() -> bool:
+        return attempt_sequence_valid and started_attempts > 0 and started_attempts == finished_attempts
+
+    # Config objects may be shared across concurrent roles; never mutate their observers.
+    from dataclasses import replace
+    actual = replace(config, attempt_observer=observe,
+                     max_retries=min(config.max_retries, reservation.attempts - 1))
+    try:
+        if isinstance(budget, RunModelBudget):
+            try:
+                if reservation.deadline_at is None:
+                    raise ResourceBudgetError('model reservation is missing its local deadline')
+                async with asyncio.timeout(max(0.0, reservation.deadline_at - time.time())):
+                    result = await provider.complete(messages, actual)
+            except TimeoutError as exc:
+                if budget.remaining_seconds() <= 0:
+                    raise ResourceBudgetError('run elapsed-time budget exhausted') from exc
+                raise
+        else:
+            assert scope is not None
+            remaining = scope.ledger.snapshot().activity_remaining_us / 1_000_000
+            async with asyncio.timeout(min(remaining, llm_call_deadline_seconds(actual))):
+                result = await provider.complete(messages, actual)
+        if isinstance(budget, ContractModelBudget):
+            budget.record_response_identity(reservation, result)
+    except BaseException as exc:
+        if isinstance(budget, ContractModelBudget):
+            budget.record_failure_identity(reservation, getattr(exc, "model_identity", None))
+        budget.settle(reservation, usage=getattr(exc, "usage", None), complete=False,
+                      outcome="cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                      sdk_attempts=started_attempts, attempts_complete=attempts_are_known())
+        raise
+    budget.settle(reservation, usage=result.raw.get("usage"), complete=not unknown_attempt,
+                  outcome="completed", sdk_attempts=started_attempts,
+                  attempts_complete=attempts_are_known())
+    if scope is not None and scope.ledger.snapshot().reservation_overrun:
+        raise ResourceBudgetError("actual model usage exceeded the reserved contract bounds")
+    return result

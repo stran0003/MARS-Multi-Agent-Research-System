@@ -1,0 +1,2449 @@
+import { boundedFetch, CLIENT_POLICY } from "./clientPolicy";
+import { ApiError } from "./apiError";
+
+// Thin REST client. By default requests stay same-origin and Next rewrites
+// /api/* to the backend; NEXT_PUBLIC_BACKEND_URL remains available for
+// deployments that need a direct backend origin.
+const CONFIGURED_BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL?.trim() || "";
+const BASE = CONFIGURED_BACKEND_URL;
+
+export type ResearchMemoryRecord = {
+  id: string; title: string; created_at: string; kind: string; status: string;
+  run_id: string; result_quality: string; is_mock: boolean;
+  metrics: Record<string, unknown>; architecture: Record<string, unknown>;
+  recipe: Record<string, unknown>; config: Record<string, unknown>; protocol: Record<string, unknown>;
+  missing: string[]; error?: string; annotations: Record<string, unknown>;
+  integrity?: { intact: boolean; problems: string[] };
+  evidence: { name: string; asset: string; sha256: string; source: string; category: string; bytes: number }[];
+};
+export type ResearchMemoryOverview = {
+  project: string; pointers: Record<string, string>; records: ResearchMemoryRecord[]; storage: string; policy: string;
+};
+export async function researchMemoryRequest<T>(project: string, suffix = "", body?: unknown, method = "POST"): Promise<T> {
+  const response = await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/research-memory${suffix}`,
+    body === undefined ? { cache: "no-store" } : { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  return jsonOrThrow<T>(response);
+}
+export function researchMemoryEvidenceUrl(project: string, id: string, index: number): string {
+  return `${BASE}/api/projects/${encodeURIComponent(project)}/research-memory/${encodeURIComponent(id)}/evidence/${index}`;
+}
+
+function apiUrl(path: string): URL {
+  const origin =
+    BASE ||
+    (typeof window === "undefined" ? "http://127.0.0.1:3001" : window.location.origin);
+  return new URL(path, origin);
+}
+
+export const STAGE_ORDER = ["idea", "experiment", "coding", "execution", "writing"] as const;
+export type Stage = (typeof STAGE_ORDER)[number];
+
+export const STAGE_TO_TIER: Record<Stage, 1 | 2 | 3 | 4 | 5> = {
+  idea: 1,
+  experiment: 2,
+  coding: 3,
+  execution: 4,
+  writing: 5,
+};
+
+export const STAGE_TO_STEM: Record<Stage, string> = {
+  idea: "idea_proposal",
+  experiment: "experiment_plan",
+  coding: "code_spec",
+  execution: "run_log",
+  writing: "research_report",
+};
+
+export type RunSummary = {
+  run_id: string;
+  project: string;
+  task: string;
+  entrypoint: string;
+  created_at: string;
+};
+
+export type TrashRunSummary = RunSummary & {
+  deleted_at: string;
+  expires_at: string;
+  days_remaining: number;
+};
+
+export type GraphNode = { key: string; kind: string; state: string; metadata: Record<string, unknown> };
+export type GraphEdge = { src: string; dst: string };
+export type RunDetail = RunSummary & {
+  review_mode?: "manual" | "commander";
+  review_generation?: number;
+  managed_review?: { status?: string; reason?: string; node?: string; kind?: string; trace_ref?: string; generation?: number } | null;
+  states: Record<string, string>;
+  graph: { nodes: GraphNode[]; edges: GraphEdge[]; entrypoints: string[] };
+  status?: string | null;
+  termination?: { type?: string; cleanup_complete?: boolean; automatic_resume?: boolean } | null;
+  read_only?: boolean;
+  read_only_reason?: string | null;
+  available_actions?: string[];
+  research_task_sha256?: string | null;
+  execution_admission?: { ready: boolean; enforced_budget_fields: string[]; blockers: { code: string; message: string; fields: string[] }[] } | null;
+};
+
+export type DataSourceProfile = {
+  id: string;
+  project: string;
+  kind: string;
+  original_name: string;
+  stored_path: string;
+  size_bytes: number;
+  checksum: string;
+  fs_mhz: number | null;
+  sample_rate_hz: number | null;
+  channel_count: number | null;
+  description: string;
+  format: string;
+  shape: number[] | null;
+  dtype: string | null;
+  preview_key: string;
+  sample_points: number;
+  dict_entries: {
+    key: string;
+    shape?: number[] | null;
+    dtype?: string | null;
+    sample_points?: number;
+  }[];
+  spectrum_available: boolean;
+  spectrum_path: string;
+  warnings: string[];
+  created_at: string;
+  is_default: boolean;
+};
+
+export type ArtifactView = {
+  run_id: string;
+  agent_dir: string;
+  stem: string;
+  version: string;
+  path: string;
+  text: string;
+  metadata: Record<string, unknown>;
+  schema_id: string | null;
+  valid: boolean;
+  errors: { path: string; message: string }[];
+};
+
+export type WorkspaceFileView = {
+  run_id: string;
+  agent_dir: string;
+  relative_path: string;
+  path: string;
+  exists: boolean;
+  text: string;
+  size_bytes: number;
+  content_type: string;
+};
+
+export type WorkspaceTreeEntry = {
+  relative_path: string;
+  name: string;
+  kind: "file" | "directory" | string;
+  path: string;
+  size_bytes: number;
+  content_type: string;
+};
+
+export type WorkspaceTreeView = {
+  run_id: string;
+  agent_dir: string;
+  root_path: string;
+  entries: WorkspaceTreeEntry[];
+};
+
+export type DiagnosisView = {
+  run_id: string;
+  version: string;
+  path: string;
+  text: string;
+  metadata: Record<string, unknown>;
+};
+
+export type FeedbackPacketView = {
+  run_id: string;
+  attempt: number;
+  path: string;
+  text: string;
+  metadata: Record<string, unknown>;
+};
+
+export type RunMemoryEventView = {
+  run_id: string;
+  path: string;
+  items: Record<string, unknown>[];
+};
+
+export type SelfEvolutionLeverItem = {
+  id: string;
+  lever_type: string;
+  agent: string;
+  title: string;
+  source: string;
+  source_path: string;
+  status: string;
+  text_preview: string;
+  evidence_refs: string[];
+  suggested_action: string;
+};
+
+export type SelfEvolutionLeversView = {
+  schema: string;
+  run_id: string;
+  project: string;
+  mutation_mode: string;
+  allowed_actions: string[];
+  levers: Record<string, SelfEvolutionLeverItem[]>;
+  counts: Record<string, number>;
+};
+
+export type SelfEvolutionMutation = Record<string, unknown> & {
+  id: string;
+  agent: string;
+  path: string;
+  status: string;
+  lever_id: string;
+  lever_type: string;
+  text_preview: string;
+};
+
+export type SelfEvolutionMutationDecision = {
+  mutation_id: string;
+  agent: string;
+  path: string;
+  status: string;
+  applied_path: string;
+};
+
+export type CommanderObservabilityView = {
+  schema: string;
+  run_id: string;
+  project: string;
+  attempt_count: number;
+  latest: Record<string, unknown> | null;
+  attempts: Record<string, unknown>[];
+  feedback_packets: Record<string, unknown>[];
+  episode_memory: Record<string, unknown>[];
+  memory_candidates: Record<string, unknown>[];
+  attempt_ledger: Record<string, unknown>;
+  checks: Record<string, number>;
+};
+
+export type CommanderAttributionEvalView = {
+  schema: string;
+  project: string;
+  case_count: number;
+  passed: number;
+  failed: number;
+  accuracy: number;
+  target_accuracy: number;
+  continuation_accuracy: number;
+  human_pause_accuracy: number;
+  cases: Record<string, unknown>[];
+};
+
+export type RunObservabilityView = {
+  schema: string;
+  run_id: string;
+  project: string;
+  task: string;
+  entrypoint: string;
+  status: string;
+  states: Record<string, string>;
+  health: Record<string, unknown>;
+  latest_event_at: string;
+  event_streams: Record<string, Record<string, unknown>>;
+  timeline: Record<string, unknown>[];
+  trace: Record<string, unknown>;
+  execution: Record<string, unknown>;
+  audit: Record<string, unknown>;
+};
+
+export type FeedbackLoopStartResult = {
+  status: string;
+  target?: string;
+  attempt?: number;
+  feedback_packet_ref?: string;
+  confidence?: number;
+  reason?: string;
+};
+
+export type MemoryPromotionView = {
+  candidate_id: string;
+  agent: string;
+  memory_id: string;
+  status: string;
+};
+
+export type PatchView = {
+  run_id: string;
+  version: string;
+  path: string;
+  text: string;
+  approved: boolean;
+  application: Record<string, unknown> | null;
+};
+
+export type TraceSpan = {
+  span_id: string;
+  parent_span_id: string | null;
+  name: string;
+  kind: string;
+  started_at: string;
+  ended_at: string | null;
+  status: string;
+  attributes: Record<string, unknown>;
+};
+
+export type TraceManifest = {
+  schema: string;
+  run_id: string;
+  trace_id: string;
+  root_span_id: string;
+  created_at: string;
+  updated_at: string;
+  spans: TraceSpan[];
+  event_index: Record<string, unknown>[];
+};
+
+export type ContextSegment = {
+  id: string;
+  kind: string;
+  title: string;
+  source_ref: string;
+  content_hash: string;
+  tokens_estimated: number;
+  priority: string;
+  selection_reason: string;
+  compression: string;
+  risk_flags: string[];
+  text_preview: string;
+  raw_ref: string | null;
+};
+
+export type ContextManifestV2 = {
+  schema: "context_manifest.v2";
+  manifest_id: string;
+  run_id: string;
+  agent: string;
+  node_key: string;
+  project: string;
+  output_schema: string;
+  purpose: string;
+  created_at: string;
+  budget: {
+    max: number;
+    target: number;
+    used: number;
+    over_budget: boolean;
+  };
+  segments: ContextSegment[];
+  render_order: string[];
+  messages_preview: { role: string; content: string }[];
+  diagnostics: Record<string, unknown>;
+  raw_refs: string[];
+};
+
+export type ContextManifestSummary = {
+  manifest_id: string;
+  agent: string;
+  node_key: string;
+  purpose: string;
+  created_at: string;
+  path: string;
+  budget: Record<string, unknown>;
+  segment_count: number;
+  risk_counts: Record<string, number>;
+};
+
+export type ContextRunView = {
+  run_id: string;
+  project: string;
+  agents: string[];
+  manifests: ContextManifestSummary[];
+  budget_summary: {
+    manifest_count: number;
+    used_tokens: number;
+    over_budget_count: number;
+  };
+  risk_summary: Record<string, number>;
+};
+
+export function normalizeContextRunView(view: ContextRunView): ContextRunView {
+  const manifests = [...new Map(
+    view.manifests.map((manifest) => [manifest.manifest_id, manifest] as const),
+  ).values()];
+  if (manifests.length === view.manifests.length) {
+    return view;
+  }
+
+  const riskSummary: Record<string, number> = {};
+  let usedTokens = 0;
+  let overBudgetCount = 0;
+  for (const manifest of manifests) {
+    const used = manifest.budget.used;
+    if (typeof used === "number" && Number.isFinite(used)) {
+      usedTokens += used;
+    }
+    if (manifest.budget.over_budget === true) {
+      overBudgetCount += 1;
+    }
+    for (const [risk, count] of Object.entries(manifest.risk_counts)) {
+      if (Number.isFinite(count)) {
+        riskSummary[risk] = (riskSummary[risk] ?? 0) + count;
+      }
+    }
+  }
+  return {
+    ...view,
+    manifests,
+    budget_summary: {
+      manifest_count: manifests.length,
+      used_tokens: usedTokens,
+      over_budget_count: overBudgetCount,
+    },
+    risk_summary: riskSummary,
+  };
+}
+
+export type ContextRawView = {
+  raw_ref: string;
+  path: string;
+  size_chars: number;
+  truncated: boolean;
+  content: string;
+};
+
+export type Stats = {
+  agents_registered: number;
+  runs_total: number;
+  runs_running: number;
+  runs_failed: number;
+  runs_waiting_review: number;
+  artifacts_total: number;
+  kb_total: number;
+  kb_per_zone: Record<string, number>;
+  states: Record<string, number>;
+  waiting_review_runs: { run_id: string; task: string; agent: string }[];
+};
+
+export type ReadinessCheck = {
+  name: string;
+  ready: boolean;
+  severity: string;
+  message: string;
+  details: Record<string, unknown>;
+};
+
+export type Readiness = {
+  ready: boolean;
+  runtime_mode: string;
+  mock_mode: string;
+  execution_backend: string;
+  project: string;
+  checks: ReadinessCheck[];
+};
+
+export type GpuDevice = {
+  index: number;
+  name: string;
+  memory_total_mb: number;
+  memory_used_mb: number;
+  utilization_gpu_percent: number;
+  temperature_c: number;
+  power_draw_w: number;
+};
+
+export type RuntimeStatus = {
+  schema: "runtime_status.v1";
+  generated_at: string;
+  project: string;
+  readiness: Readiness;
+  resources: {
+    gpu: {
+      available: boolean;
+      source: string;
+      message: string;
+      devices: GpuDevice[];
+      summary: {
+        count: number;
+        memory_total_mb: number;
+        memory_used_mb: number;
+        utilization_gpu_percent?: number;
+      };
+    };
+    execution: {
+      backend: string;
+      mock_mode: string;
+      max_concurrency: number;
+      batch_steps: number;
+      command_timeout_seconds: number;
+      allow_real_patch_apply: boolean;
+      local_command_count: number;
+      remote_gpu: {
+        enabled: boolean;
+        configured: boolean;
+      };
+      paper_static: {
+        enabled: boolean;
+        python: string;
+        python_exists: boolean;
+        repo_path: string;
+        repo_exists: boolean;
+        config_path: string;
+        config_exists: boolean;
+        data_path: string;
+        data_exists: boolean;
+        default_max_iters: number;
+        default_dry_run: boolean;
+      };
+      code_checks: {
+        lint_enabled: boolean;
+        test_enabled: boolean;
+      };
+    };
+  };
+  observability: {
+    langsmith: {
+      enabled: boolean;
+      configured: boolean;
+      package_available: boolean;
+      project: string;
+      endpoint: string;
+      timeout_ms: number;
+      ui_url: string;
+      embed_url: string;
+      message: string;
+    };
+    tracing: {
+      enabled: boolean;
+      exporter: string;
+      manifest_path: string;
+      file_sink: boolean;
+      websocket_sink: boolean;
+    };
+  };
+  config: {
+    runtime: {
+      mode: string;
+      mock_mode: string;
+      default_project: string;
+      llm_timeout_seconds: number;
+    };
+    llm: {
+      available_providers: string[];
+      agents_configured: number;
+      secrets_configured: Record<string, boolean>;
+    };
+    tools: {
+      total: number;
+      enabled: number;
+      disabled: number;
+      network_defined: number;
+      network_runtime_enabled: boolean;
+      web_search_provider: string;
+    };
+    context: {
+      max_tokens: number;
+      target_tokens: number;
+      auto_compress: boolean;
+      tool_raw_externalize: boolean;
+      workbench_enabled: boolean;
+    };
+    mcp: Record<string, boolean>;
+  };
+};
+
+export type AgentContextFile = {
+  agent: string;
+  path: string;
+  category: string;
+  source: string;
+  editable: boolean;
+  deletable: boolean;
+  size_chars: number;
+  content: string;
+};
+
+export type AgentResearchSite = {
+  id: string;
+  label: string;
+  url: string;
+  enabled: boolean;
+  source: string;
+};
+
+export type AgentCodeRepository = {
+  project: string;
+  label: string;
+  repo_mode: string;
+  repo_path: string;
+  exists: boolean;
+  read_only: boolean;
+  sync_strategy: string;
+  allowed_paths: string[];
+  protected_paths: string[];
+  ignore_patterns: string[];
+  baseline_rules_file: string;
+};
+
+export type AgentContextBlueprintItem = {
+  order: number;
+  layer: string;
+  content: string;
+  storage: string[];
+  required: string;
+  risk: string;
+  strategy: string;
+  packing_position: string;
+};
+
+export type AgentContextStorageLayout = {
+  long_term_root: string;
+  run_root: string;
+  agent_root: string;
+  manifests: string;
+  raw: string;
+  packed: string;
+  memory: string;
+  research: string;
+  debate: string;
+  tool_results: string;
+};
+
+export type AgentContextBlueprint = {
+  agent: string;
+  goal: string;
+  storage_layout: AgentContextStorageLayout;
+  items: AgentContextBlueprintItem[];
+  packing_order: string[];
+};
+
+export type AgentContextView = {
+  agent: string;
+  files: AgentContextFile[];
+  research_sites: AgentResearchSite[];
+  code_repositories: AgentCodeRepository[];
+  blueprint: AgentContextBlueprint;
+  defaults: {
+    editable_categories?: string[];
+    read_only_sources?: string[];
+  };
+};
+
+export type CodeSource = {
+  id: string;
+  label: string;
+  path: string;
+  exists: boolean;
+  read_only: boolean;
+  kind: string;
+};
+
+export type CodeTreeItem = {
+  path: string;
+  name: string;
+  kind: "directory" | "file";
+  depth: number;
+  size_chars: number;
+  language: string;
+};
+
+export type CodeFileContent = {
+  source_id: string;
+  path: string;
+  language: string;
+  size_chars: number;
+  truncated: boolean;
+  content: string;
+};
+
+export type UpstreamContextItem = {
+  id: string;
+  agent: string;
+  title: string;
+  path: string;
+  kind: string;
+  content: string;
+};
+
+export type CodingMemoryItem = {
+  id: string;
+  label: string;
+  text: string;
+  enabled: boolean;
+  source: string;
+  editable: boolean;
+};
+
+export type CodingWorkspace = {
+  project: string;
+  selected_source: string;
+  sources: CodeSource[];
+  files: CodeTreeItem[];
+  upstream_context: UpstreamContextItem[];
+  memory_items: CodingMemoryItem[];
+  kb_memory_items: CodingMemoryItem[];
+};
+
+export async function getReadiness(project?: string): Promise<Readiness> {
+  const url = apiUrl(`${BASE}/api/readiness`);
+  if (project) {
+    url.searchParams.set("project", project);
+  }
+  return jsonOrThrow(await boundedFetch(url));
+}
+
+export async function getRuntimeStatus(project?: string): Promise<RuntimeStatus> {
+  const url = apiUrl(`${BASE}/api/runtime/status`);
+  if (project) {
+    url.searchParams.set("project", project);
+  }
+  return jsonOrThrow(await fetch(url));
+}
+
+export type Template = { schema_id: string; text: string };
+export async function getTemplate(schemaId: string): Promise<Template> {
+  return jsonOrThrow(await fetch(`${BASE}/api/templates/${schemaId}`));
+}
+export async function getTemplateByAgent(agent: string): Promise<Template> {
+  return jsonOrThrow(await fetch(`${BASE}/api/templates/by_agent/${agent}`));
+}
+
+export type ZoneSummary = { name: string; label_zh: string; count: number };
+
+export type KBItem = {
+  id: string;
+  zone: string;
+  text: string;
+  text_excerpt: string;
+  metadata: Record<string, unknown>;
+};
+
+export type KnowledgeMemoryType = "semantic" | "episodic" | "procedural";
+export type KnowledgeProfile = "dev_e2e" | "research" | "hardware";
+
+export type KnowledgeSearchHit = {
+  score: number;
+  item: KBItem;
+};
+
+export type KnowledgeSearchParams = {
+  q: string;
+  topK?: number;
+  zone?: string;
+  zones?: string[];
+  project?: string;
+  memoryType?: KnowledgeMemoryType;
+  includeMock?: boolean;
+  includeSuperseded?: boolean;
+  profile?: KnowledgeProfile;
+};
+
+export type ProjectSummary = {
+  name: string;
+  display_name?: string;
+  folder_path?: string;
+  project_type?: "configured" | "folder";
+  description: string;
+  domain: string;
+  tags: string[];
+  repo_path: string;
+  repo_exists: boolean;
+  repo_read_only?: boolean;
+  repo_role?: string;
+  baseline_repo_path?: string;
+};
+
+export type EventEntry = {
+  run_id: string;
+  channel: string;
+  timestamp: string;
+  payload: Record<string, unknown>;
+};
+
+export type EvaluationDecision = "pass" | "warn" | "revise" | "block" | "fail";
+
+export type EvaluationFinding = {
+  id?: string;
+  severity?: string;
+  category?: string;
+  message?: string;
+  evidence_refs?: string[];
+  target_ref?: string;
+  evaluator?: string;
+};
+
+export type EvaluationReportItem = {
+  path?: string;
+  target_ref?: string;
+  target_schema?: string;
+  evaluator?: string;
+  decision?: EvaluationDecision | string;
+  blocking?: boolean;
+  overall_score?: number | null;
+  finding_count?: number;
+  findings?: EvaluationFinding[];
+};
+
+export type EvaluationPolicyDecision = {
+  schema: string;
+  scope: "artifact" | "run" | string;
+  gate: "pass" | "warn" | "revise" | "block" | string;
+  action: string;
+  review_priority: "normal" | "elevated" | "high" | "critical" | string;
+  auto_approval_allowed?: boolean;
+  auto_approval_enforced?: boolean;
+  completion_allowed?: boolean;
+  enforcement_mode?: string;
+  thresholds?: Record<string, unknown>;
+  reasons: string[];
+};
+
+export type ArtifactEvaluationSummary = {
+  agent: string;
+  node: string;
+  artifact_ref: string;
+  artifact_id: string;
+  stem: string;
+  version: string;
+  decision: EvaluationDecision | string;
+  blocking: boolean;
+  report_count: number;
+  overall_score: number | null;
+  top_findings: EvaluationFinding[];
+  reports: EvaluationReportItem[];
+  policy?: EvaluationPolicyDecision;
+};
+
+export type ArtifactEvaluationReport = {
+  path: string;
+  filename: string;
+  evaluator_slug: string;
+  metadata: {
+    target_ref?: string;
+    target_schema?: string;
+    evaluator?: string;
+    decision?: EvaluationDecision | string;
+    blocking?: boolean;
+    overall_score?: number | null;
+    findings?: EvaluationFinding[];
+    recommended_actions?: string[];
+    created?: string;
+    [key: string]: unknown;
+  };
+  text: string;
+};
+
+export type EvaluationScorecard = {
+  schema: string;
+  run_id: string;
+  project: string;
+  created: string;
+  overall_decision: EvaluationDecision | string;
+  overall_score: number | null;
+  counts: Record<string, number>;
+  report_count: number;
+  finding_count: number;
+  top_findings: EvaluationFinding[];
+  reports: EvaluationReportItem[];
+  quality_gate?: EvaluationPolicyDecision;
+};
+
+export type PostTrainingExportRecord = {
+  schema: string;
+  created: string;
+  run_id: string;
+  project: string;
+  artifact: Record<string, unknown>;
+  output: Record<string, unknown>;
+  evaluation: Record<string, unknown>;
+  labels: Record<string, Record<string, unknown>>;
+  preference_candidate: Record<string, unknown>;
+  training_eligible: boolean;
+};
+
+export type PostTrainingExportManifest = {
+  schema: string;
+  run_id: string;
+  project: string;
+  created: string;
+  path: string;
+  record_count: number;
+  eligible_count: number;
+  include_drafts: boolean;
+  min_artifact_score: number;
+  allowed_decisions: string[];
+  records_preview: PostTrainingExportRecord[];
+};
+
+export type ExecutionPlot = {
+  filename: string;
+  experiment_id: string;
+  metric: string;
+  url: string;
+  updated_at: number;
+  size_bytes: number;
+};
+
+export type McpAdapterStatus = {
+  kind: "chroma" | "filesystem" | "git" | "github";
+  configured: boolean;
+  available: boolean;
+  detail: string;
+  fallback: string;
+  tools: string[];
+};
+
+export type ToolSpecView = {
+  name: string;
+  namespace: string;
+  description: string;
+  policy: Record<string, unknown>;
+  bridge_only: boolean;
+  mcp_adapter: McpAdapterStatus | null;
+};
+
+export type ToolAuditEntry = Record<string, unknown> & {
+  call_id?: string;
+  tool?: string;
+  status?: string;
+  agent?: string;
+  duration_ms?: number;
+  error?: string | null;
+  rollback_ref?: string | null;
+};
+
+export type ToolAuditFilters = {
+  tool?: string;
+  status?: string;
+  callId?: string;
+  event?: string;
+  limit?: number;
+};
+
+export type ToolApprovalRecord = Record<string, unknown> & {
+  approval_id: string;
+  tool: string;
+  status: string;
+  reason?: string;
+  created_at?: string;
+};
+
+export type TimelineItem = {
+  id: string;
+  timestamp: string;
+  source: string;
+  kind: string;
+  title: string;
+  summary: string;
+  status: string;
+  agent: string;
+  node: string;
+  payload: Record<string, unknown>;
+};
+
+export type WorkLogItem = {
+  id: string;
+  timestamp: string;
+  elapsed_seconds: number | null;
+  agent: string;
+  kind: string;
+  status: string;
+  title: string;
+  detail: string;
+  next_action: string;
+  evidence_refs: string[];
+};
+
+export type WorkLogView = {
+  run_id: string;
+  project: string;
+  agent: string;
+  status: string;
+  started_at: string;
+  latest_at: string;
+  elapsed_seconds: number | null;
+  items: WorkLogItem[];
+};
+
+export type ReportDeliverable = {
+  kind: "markdown" | "excel" | "word" | "powerpoint" | string;
+  path: string;
+  status: "completed" | "failed" | "skipped" | string;
+  error?: string;
+  bytes?: number;
+};
+
+export type ReportQaStatus = {
+  status: "passed" | "degraded" | "failed" | string;
+  checks: { name: string; status: string; detail?: string }[];
+};
+
+export type ReportBundle = {
+  exists: boolean;
+  run_id?: string;
+  manifest?: string;
+  metadata?: {
+    schema?: string;
+    project?: string;
+    agent?: string;
+    run_id?: string;
+    created_at?: string;
+    data_pack?: string;
+    deliverables?: ReportDeliverable[];
+    source_refs?: string[];
+    qa_status?: ReportQaStatus;
+    generation_errors?: string[];
+    [key: string]: unknown;
+  };
+  body?: string;
+};
+
+export type ConfigFile = {
+  name: string;
+  path: string;
+  text: string;
+  data: Record<string, unknown>;
+  high_risk: boolean;
+};
+
+export type ConfigSnapshot = {
+  files: ConfigFile[];
+};
+
+export type ConfigValidationResult = {
+  valid: boolean;
+  errors: string[];
+  data: Record<string, unknown>;
+};
+
+export type ConfigDiffResult = {
+  name: string;
+  diff: string;
+  valid: boolean;
+  errors: string[];
+  high_risk: boolean;
+};
+
+export type ProviderDefaultView = {
+  api_key_env: string;
+  base_url: string;
+  base_url_env: string;
+  configured: boolean;
+  base_url_configured: boolean;
+};
+
+export type AgentLlmConfigRow = {
+  agent: string;
+  enabled: boolean;
+  provider: string;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  api_key_env: string;
+  api_key_configured: boolean;
+  base_url: string;
+  base_url_env: string;
+  base_url_configured: boolean;
+};
+
+export type AgentLlmConfigView = {
+  agents: AgentLlmConfigRow[];
+  providers: string[];
+  provider_defaults: Record<string, ProviderDefaultView>;
+  secrets_path: string;
+  note: string;
+};
+
+export type AgentLlmUpdateRow = {
+  agent: string;
+  enabled: boolean;
+  provider: string;
+  model: string;
+  temperature: number;
+  max_tokens: number;
+  api_key_env: string;
+  api_key?: string;
+  base_url: string;
+  base_url_env: string;
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function errorDetailText(status: number, body: string): string {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    const detail = isRecord(parsed) ? parsed.detail : parsed;
+    if (typeof detail === "string") return `HTTP ${status}: ${detail}`;
+    if (isRecord(detail)) {
+      const error = typeof detail.error === "string" ? detail.error.trim() : "";
+      const explanation = typeof detail.message === "string" ? detail.message.trim() : "";
+      const patchVersion =
+        typeof detail.patch_version === "string" ? `patch ${detail.patch_version}: ` : "";
+      const blockedByGate =
+        typeof detail.blocked_by_gate === "string" && detail.blocked_by_gate
+          ? ` blocked by ${detail.blocked_by_gate}.`
+          : "";
+      const command = isRecord(detail.command_result) ? detail.command_result : null;
+      const stderr = typeof command?.stderr === "string" ? command.stderr.trim() : "";
+      const stdout = typeof command?.stdout === "string" ? command.stdout.trim() : "";
+      const message = error || explanation || stderr || stdout || body;
+      return `HTTP ${status}: ${patchVersion}${message}${blockedByGate}`;
+    }
+  } catch {
+    // Fall through to the raw body.
+  }
+  return `HTTP ${status}: ${body}`;
+}
+
+async function jsonOrThrow<T>(r: Response): Promise<T> {
+  if (!r.ok) {
+    const text = await r.text();
+    throw new ApiError(errorDetailText(r.status, text), r.status);
+  }
+  return (await r.json()) as T;
+}
+
+// ---------- runs ----------
+export async function listRuns(project?: string, signal?: AbortSignal): Promise<RunSummary[]> {
+  const url = apiUrl(`${BASE}/api/runs`);
+  if (project) {
+    url.searchParams.set("project", project);
+  }
+  return jsonOrThrow(await boundedFetch(url, { signal, cache: "no-store" }));
+}
+export async function listTrashedRuns(project?: string): Promise<TrashRunSummary[]> {
+  const url = apiUrl(`${BASE}/api/runs/trash`);
+  if (project) {
+    url.searchParams.set("project", project);
+  }
+  return jsonOrThrow(await fetch(url));
+}
+export async function getRun(runId: string): Promise<RunDetail> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${runId}`));
+}
+
+export type EvolutionView = {
+  status: string; verification_count: number;
+  contract: { goal: string; max_iterations: number; verification_runs: number };
+  best: { attempt: number; winner: { experiment_id: string; metrics: Record<string, number> } } | null;
+  last_decision?: { continue: boolean; reason: string };
+  proposal?: { mechanism: string; approval_recorded: boolean; modules: { module: string; path: string }[] };
+  attempts: { attempt: number; iteration?: number; passed: boolean; metrics_ref: string;
+    winner: { experiment_id: string; checks: { name: string; observed: number | null; target: number;
+      value: number | null; baseline: number | null; comparison: string;
+      direction: string; passed: boolean; gap: number | null }[] } | null;
+    protocol_errors: string[]; decision: { status: string; reason: string } }[];
+};
+
+export async function getEvolution(runId: string, project: string): Promise<{ evolution: EvolutionView | null }> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/evolution?project=${encodeURIComponent(project)}`, { cache: "no-store" }));
+}
+
+export async function continueEvolution(runId: string, project: string): Promise<{ ok: boolean; status: string }> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/evolution/continue`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project }),
+  }));
+}
+export type IdeaContext = Partial<Record<
+  "background" | "baseline_code" | "data_description" | "analysis_results" | "metric_definition" | "literature_notes",
+  string
+>>;
+
+export async function createRun(body: {
+  task: string;
+  project: string;
+  entrypoint?: string;
+  user_request?: string;
+  standalone?: boolean;
+  seed_artifact?: string;
+  idea_context?: IdeaContext;
+  idea_scope?: "method_proposal" | "project_proposal";
+  data_source?: {
+    id: string;
+    fs_mhz?: number | null;
+    kind?: string | null;
+    channel_count?: number | null;
+    description?: string | null;
+  };
+}, signal?: AbortSignal): Promise<RunDetail> {
+  return jsonOrThrow(
+    await boundedFetch(`${BASE}/api/runs`, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        entrypoint: "pipeline",
+        standalone: false,
+        user_request: "",
+        ...body,
+      }),
+    }),
+  );
+}
+export async function startRun(runId: string, signal?: AbortSignal): Promise<{ status: string }> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/start`, { method: "POST", signal }));
+}
+
+export async function deleteRun(runId: string): Promise<TrashRunSummary> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${encodeURIComponent(runId)}`, { method: "DELETE" }),
+  );
+}
+
+export async function restoreRun(runId: string): Promise<RunSummary> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/restore`, { method: "POST" }),
+  );
+}
+
+export async function permanentlyDeleteRun(runId: string): Promise<void> {
+  const response = await fetch(`${BASE}/api/runs/trash/${encodeURIComponent(runId)}`, {
+    method: "DELETE",
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(errorDetailText(response.status, text));
+  }
+}
+
+export async function uploadDataSource(params: {
+  file: File;
+  project: string;
+  fsMhz?: number | null;
+  kind?: string;
+  channelCount?: number | null;
+  description?: string;
+}, signal?: AbortSignal): Promise<DataSourceProfile> {
+  const url = apiUrl(`${BASE}/api/data-sources/upload`);
+  url.searchParams.set("filename", params.file.name);
+  url.searchParams.set("project", params.project);
+  if (params.fsMhz !== undefined && params.fsMhz !== null) {
+    url.searchParams.set("fs_mhz", String(params.fsMhz));
+  }
+  if (params.kind) {
+    url.searchParams.set("kind", params.kind);
+  }
+  if (params.channelCount !== undefined && params.channelCount !== null) {
+    url.searchParams.set("channel_count", String(params.channelCount));
+  }
+  if (params.description) {
+    url.searchParams.set("description", params.description);
+  }
+  return jsonOrThrow(
+    await boundedFetch(url, {
+      method: "POST",
+      signal,
+      headers: { "Content-Type": "application/octet-stream" },
+      body: params.file,
+    }),
+  );
+}
+
+export async function listDataSources(project?: string): Promise<DataSourceProfile[]> {
+  const url = apiUrl(`${BASE}/api/data-sources`);
+  if (project) {
+    url.searchParams.set("project", project);
+  }
+  return jsonOrThrow(await fetch(url));
+}
+
+export async function getDataSource(id: string): Promise<DataSourceProfile> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/data-sources/${encodeURIComponent(id)}`),
+  );
+}
+
+export async function getDefaultDataSource(project: string): Promise<DataSourceProfile> {
+  const url = apiUrl(`${BASE}/api/data-sources/default`);
+  url.searchParams.set("project", project);
+  return jsonOrThrow(await fetch(url));
+}
+
+export async function setDefaultDataSource(
+  project: string,
+  id: string,
+): Promise<DataSourceProfile> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/data-sources/default`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project, id }),
+    }),
+  );
+}
+
+export async function updateDataSource(
+  id: string,
+  body: {
+    fs_mhz?: number | null;
+    kind?: string | null;
+    channel_count?: number | null;
+    description?: string | null;
+  },
+): Promise<DataSourceProfile> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/data-sources/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export function dataSourceSpectrumUrl(id: string): string {
+  return `${BASE}/api/data-sources/${encodeURIComponent(id)}/spectrum`;
+}
+
+export async function retryAgent(
+  runId: string,
+  agent: string,
+  reason: string,
+): Promise<{ status: string; run_id: string; agent: string; node: string }> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/agents/${agent}/retry`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+
+// ---------- tools ----------
+export async function listTools(): Promise<ToolSpecView[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/tools`));
+}
+
+export async function listToolAdapters(): Promise<McpAdapterStatus[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/tools/adapters`));
+}
+
+export async function listRunToolCalls(
+  runId: string,
+  filters: ToolAuditFilters = {},
+): Promise<ToolAuditEntry[]> {
+  const url = apiUrl(`${BASE}/api/runs/${runId}/tools`);
+  if (filters.tool) url.searchParams.set("tool", filters.tool);
+  if (filters.status) url.searchParams.set("status", filters.status);
+  if (filters.callId) url.searchParams.set("call_id", filters.callId);
+  if (filters.event) url.searchParams.set("event", filters.event);
+  if (filters.limit) url.searchParams.set("limit", String(filters.limit));
+  return jsonOrThrow(await fetch(url.toString()));
+}
+
+export async function listToolApprovals(runId: string): Promise<ToolApprovalRecord[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/tools/approvals`));
+}
+
+export async function approveToolCall(
+  runId: string,
+  callId: string,
+): Promise<{ ok: boolean; approval_id: string; status: string; result: unknown }> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/tools/${callId}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ actor: "ui" }),
+    }),
+  );
+}
+
+export async function rejectToolCall(
+  runId: string,
+  callId: string,
+): Promise<{ ok: boolean; approval_id: string; status: string }> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/tools/${callId}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ actor: "ui" }),
+    }),
+  );
+}
+
+export async function rollbackToolCall(
+  runId: string,
+  callId: string,
+): Promise<{ ok: boolean; result: unknown }> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/tools/${callId}/rollback`, {
+      method: "POST",
+    }),
+  );
+}
+
+// ---------- artifacts ----------
+export async function listVersions(runId: string, agentDir: string, stem: string) {
+  return jsonOrThrow<{ version: string; path: string; filename: string }[]>(
+    await boundedFetch(`${BASE}/api/artifacts/${runId}/${agentDir}/${stem}/versions`),
+  );
+}
+export async function getArtifact(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  version: string,
+): Promise<ArtifactView> {
+  return jsonOrThrow(
+    await boundedFetch(`${BASE}/api/artifacts/${runId}/${agentDir}/${stem}/${version}`),
+  );
+}
+export async function getWorkspaceFile(
+  runId: string,
+  agentDir: string,
+  path: string,
+): Promise<WorkspaceFileView> {
+  const url = apiUrl(`${BASE}/api/artifacts/${runId}/${agentDir}/workspace-file`);
+  url.searchParams.set("path", path);
+  return jsonOrThrow(await fetch(url));
+}
+export async function getWorkspaceTree(
+  runId: string,
+  agentDir: string,
+): Promise<WorkspaceTreeView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/artifacts/${runId}/${agentDir}/workspace-tree`));
+}
+export async function diffVersions(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  from: string,
+  to: string,
+): Promise<{ diff: string }> {
+  const url = apiUrl(`${BASE}/api/artifacts/${runId}/${agentDir}/${stem}/diff`);
+  url.searchParams.set("from_", from);
+  url.searchParams.set("to", to);
+  return jsonOrThrow(await fetch(url));
+}
+export async function editArtifact(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  version: string,
+  payload: { body?: string; metadata_patch?: Record<string, unknown> },
+): Promise<ArtifactView> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/api/artifacts/${runId}/${agentDir}/${stem}/${version}/edit`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      },
+    ),
+  );
+}
+export async function approveArtifact(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  version: string,
+): Promise<ArtifactView> {
+  return jsonOrThrow(
+    await boundedFetch(
+      `${BASE}/api/artifacts/${runId}/${agentDir}/${stem}/${version}/approve`,
+      { method: "POST" },
+    ),
+  );
+}
+export async function rejectArtifact(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  reason: string,
+): Promise<{ status: string }> {
+  return jsonOrThrow(
+    await boundedFetch(`${BASE}/api/artifacts/${runId}/${agentDir}/${stem}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+export async function getPatch(runId: string, version: string): Promise<PatchView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/artifacts/${runId}/coding/patch/${version}`));
+}
+export async function approvePatch(runId: string, version: string): Promise<ArtifactView> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/artifacts/${runId}/coding/patch/${version}/approve`, {
+      method: "POST",
+    }),
+  );
+}
+export async function rejectPatch(
+  runId: string,
+  version: string,
+  reason: string,
+): Promise<{ status: string }> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/artifacts/${runId}/coding/patch/${version}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    }),
+  );
+}
+export async function pendingReviews(runId: string) {
+  return jsonOrThrow<
+    {
+      run_id: string;
+      agent: string;
+      artifact_path: string;
+      version: string;
+      decision: string | null;
+    }[]
+  >(await fetch(`${BASE}/api/artifacts/${runId}/pending`));
+}
+
+export async function listDiagnoses(runId: string): Promise<DiagnosisView[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/diagnoses`));
+}
+
+export async function listFeedbackPackets(runId: string): Promise<FeedbackPacketView[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/feedback-packets`));
+}
+
+export async function listMemoryCandidates(runId: string): Promise<RunMemoryEventView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/memory-candidates`));
+}
+
+export async function listEpisodeMemory(runId: string): Promise<RunMemoryEventView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/episode-memory`));
+}
+
+export async function getSelfEvolutionLevers(runId: string): Promise<SelfEvolutionLeversView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/self-evolution/levers`));
+}
+
+export async function listSelfEvolutionMutations(
+  runId: string,
+): Promise<RunMemoryEventView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/self-evolution/mutations`));
+}
+
+export async function createSelfEvolutionMutation(
+  runId: string,
+  body: {
+    lever_id: string;
+    agent: string;
+    path: string;
+    proposed_content: string;
+    rationale?: string;
+  },
+): Promise<SelfEvolutionMutation> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/self-evolution/mutations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function approveSelfEvolutionMutation(
+  runId: string,
+  mutationId: string,
+  reviewerNote = "approved from Commander UI",
+): Promise<SelfEvolutionMutationDecision> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/self-evolution/mutations/${encodeURIComponent(mutationId)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer_note: reviewerNote }),
+    }),
+  );
+}
+
+export async function rejectSelfEvolutionMutation(
+  runId: string,
+  mutationId: string,
+  reviewerNote = "rejected from Commander UI",
+): Promise<SelfEvolutionMutationDecision> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/self-evolution/mutations/${encodeURIComponent(mutationId)}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer_note: reviewerNote }),
+    }),
+  );
+}
+
+export async function getCommanderObservability(
+  runId: string,
+): Promise<CommanderObservabilityView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/runs/${runId}/commander-observability`));
+}
+
+export async function getCommanderAttributionEval(
+  project = "pimc",
+): Promise<CommanderAttributionEvalView> {
+  const url = apiUrl(`${BASE}/api/evaluation/commander-attribution`);
+  url.searchParams.set("project", project);
+  return jsonOrThrow(await fetch(url));
+}
+
+export async function getEvaluationScorecard(runId: string): Promise<EvaluationScorecard> {
+  return jsonOrThrow(await fetch(`${BASE}/api/evaluation/runs/${runId}/scorecard`));
+}
+
+export async function getPostTrainingExport(
+  runId: string,
+): Promise<PostTrainingExportManifest> {
+  return jsonOrThrow(await fetch(`${BASE}/api/evaluation/runs/${runId}/post-training-export`));
+}
+
+export async function createPostTrainingExport(
+  runId: string,
+  includeDrafts = false,
+): Promise<PostTrainingExportManifest> {
+  const url = apiUrl(`${BASE}/api/evaluation/runs/${runId}/post-training-export`);
+  url.searchParams.set("include_drafts", includeDrafts ? "true" : "false");
+  return jsonOrThrow(await fetch(url, { method: "POST" }));
+}
+
+export async function getArtifactEvaluationSummary(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  version: string,
+): Promise<ArtifactEvaluationSummary> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/evaluation/runs/${runId}/artifacts/${agentDir}/${stem}/${version}/summary`),
+  );
+}
+
+export async function listArtifactEvaluations(
+  runId: string,
+  agentDir: string,
+  stem: string,
+  version: string,
+): Promise<ArtifactEvaluationReport[]> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/evaluation/runs/${runId}/artifacts/${agentDir}/${stem}/${version}`),
+  );
+}
+
+export async function getRunObservability(
+  runId: string,
+  limit = 120,
+): Promise<RunObservabilityView> {
+  const url = apiUrl(`${BASE}/api/runs/${runId}/observability`);
+  url.searchParams.set("limit", String(limit));
+  return jsonOrThrow(await boundedFetch(url));
+}
+
+export async function startFeedbackLoop(
+  runId: string,
+  diagnosisVersion: string,
+): Promise<FeedbackLoopStartResult> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/runs/${runId}/feedback-loop/${diagnosisVersion}/start`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function approveMemoryCandidate(
+  runId: string,
+  candidateId: string,
+): Promise<MemoryPromotionView> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/memory-candidates/${runId}/${encodeURIComponent(candidateId)}/approve`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function rejectMemoryCandidate(
+  runId: string,
+  candidateId: string,
+  reviewerNote = "rejected from Commander UI",
+): Promise<MemoryPromotionView> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/memory-candidates/${runId}/${encodeURIComponent(candidateId)}/reject`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer_note: reviewerNote }),
+    }),
+  );
+}
+
+export async function markMemoryCandidateStale(
+  runId: string,
+  candidateId: string,
+  reviewerNote = "marked stale from Commander UI",
+): Promise<MemoryPromotionView> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/memory-candidates/${runId}/${encodeURIComponent(candidateId)}/stale`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer_note: reviewerNote }),
+    }),
+  );
+}
+
+export async function supersedeMemoryCandidate(
+  runId: string,
+  candidateId: string,
+  supersededBy = "",
+  reviewerNote = "superseded from Commander UI",
+): Promise<MemoryPromotionView> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/memory-candidates/${runId}/${encodeURIComponent(candidateId)}/supersede`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reviewer_note: reviewerNote, superseded_by: supersededBy }),
+    }),
+  );
+}
+
+export async function getTrace(runId: string): Promise<TraceManifest> {
+  return jsonOrThrow(await fetch(`${BASE}/api/traces/${runId}`));
+}
+
+export async function getContextRun(runId: string): Promise<ContextRunView> {
+  const view = await jsonOrThrow<ContextRunView>(
+    await fetch(`${BASE}/api/context/runs/${runId}`),
+  );
+  return normalizeContextRunView(view);
+}
+
+export async function getContextManifest(
+  runId: string,
+  manifestId: string,
+): Promise<ContextManifestV2> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/context/runs/${runId}/manifests/${manifestId}`),
+  );
+}
+
+export async function getContextRaw(
+  runId: string,
+  rawRef: string,
+): Promise<ContextRawView> {
+  const encodedRef = rawRef.split("/").map(encodeURIComponent).join("/");
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/context/runs/${runId}/raw/${encodedRef}`),
+  );
+}
+
+export async function previewContext(body: {
+  agent: string;
+  project: string;
+  task: string;
+  upstream?: Record<string, string>;
+}): Promise<ContextManifestV2> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/context/preview`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export type DebateTranscript = {
+  exists: boolean;
+  agent: string;
+  path?: string;
+  text: string;
+};
+
+export async function getDebateTranscript(
+  runId: string,
+  agentDir: string,
+): Promise<DebateTranscript> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/artifacts/${runId}/${agentDir}/debate`),
+  );
+}
+
+// ---------- agent context configuration ----------
+export async function getAgentContext(agent: string, project?: string): Promise<AgentContextView> {
+  const suffix = project ? `?project=${encodeURIComponent(project)}` : "";
+  return jsonOrThrow(await fetch(`${BASE}/api/agents/${agent}/context${suffix}`));
+}
+
+export async function createAgentContextItem(
+  agent: string,
+  body: { category: string; filename: string; content: string },
+): Promise<AgentContextFile> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/${agent}/context/items`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function updateAgentContextItem(
+  agent: string,
+  body: { path: string; content: string },
+): Promise<AgentContextFile> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/${agent}/context/items`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function deleteAgentContextItem(
+  agent: string,
+  path: string,
+): Promise<{ status: string; path: string }> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/${agent}/context/items`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    }),
+  );
+}
+
+export async function updateAgentResearchSites(
+  agent: string,
+  sites: AgentResearchSite[],
+): Promise<AgentResearchSite[]> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/${agent}/context/research-sites`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sites }),
+    }),
+  );
+}
+
+export async function updateAgentCodeRepositories(
+  agent: string,
+  project: string,
+  repositories: AgentCodeRepository[],
+): Promise<AgentCodeRepository[]> {
+  return jsonOrThrow(
+    await fetch(
+      `${BASE}/api/agents/${agent}/context/code-repositories?project=${encodeURIComponent(project)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ repositories }),
+      },
+    ),
+  );
+}
+
+export async function getCodingWorkspace(params: {
+  project: string;
+  runId?: string;
+  source?: string;
+}): Promise<CodingWorkspace> {
+  const url = apiUrl(`${BASE}/api/agents/coding/workspace`);
+  url.searchParams.set("project", params.project);
+  url.searchParams.set("source", params.source ?? "auto");
+  if (params.runId) {
+    url.searchParams.set("run_id", params.runId);
+  }
+  return jsonOrThrow(await fetch(url));
+}
+
+export async function getCodingWorkspaceFile(params: {
+  project: string;
+  source: string;
+  path: string;
+}): Promise<CodeFileContent> {
+  const url = apiUrl(`${BASE}/api/agents/coding/workspace/file`);
+  url.searchParams.set("project", params.project);
+  url.searchParams.set("source", params.source);
+  url.searchParams.set("path", params.path);
+  return jsonOrThrow(await fetch(url));
+}
+
+export async function updateCodingMemoryItems(
+  items: CodingMemoryItem[],
+): Promise<CodingMemoryItem[]> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/agents/coding/workspace/memory`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items }),
+    }),
+  );
+}
+
+// ---------- new endpoints ----------
+export async function getStats(): Promise<Stats> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/stats`));
+}
+export async function listZones(): Promise<ZoneSummary[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/knowledge/zones`));
+}
+export async function listZoneItems(zone: string, limit = 20): Promise<KBItem[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/knowledge/${zone}/items?limit=${limit}`));
+}
+export async function listQuarantineItems(params?: {
+  limit?: number;
+  project?: string;
+  memoryType?: KnowledgeMemoryType;
+  includeMock?: boolean;
+  includeSuperseded?: boolean;
+}): Promise<KBItem[]> {
+  const url = apiUrl(`${BASE}/api/knowledge/quarantine/items`);
+  url.searchParams.set("limit", String(params?.limit ?? 20));
+  addKnowledgeParams(url, {
+    project: params?.project,
+    memoryType: params?.memoryType,
+    includeMock: params?.includeMock,
+    includeSuperseded: params?.includeSuperseded,
+  });
+  return jsonOrThrow(await fetch(url));
+}
+export async function searchKnowledge(params: KnowledgeSearchParams): Promise<KnowledgeSearchHit[]> {
+  const url = apiUrl(`${BASE}/api/knowledge/search`);
+  addKnowledgeParams(url, params);
+  return jsonOrThrow(await fetch(url));
+}
+export async function searchQuarantine(
+  params: Omit<KnowledgeSearchParams, "zone" | "zones" | "profile">,
+): Promise<KnowledgeSearchHit[]> {
+  const url = apiUrl(`${BASE}/api/knowledge/quarantine/search`);
+  addKnowledgeParams(url, params);
+  return jsonOrThrow(await fetch(url));
+}
+export async function searchZone(
+  zone: string,
+  q: string,
+  topK = 5,
+): Promise<KnowledgeSearchHit[]> {
+  const url = apiUrl(`${BASE}/api/knowledge/${zone}/search`);
+  url.searchParams.set("q", q);
+  url.searchParams.set("top_k", String(topK));
+  return jsonOrThrow(await fetch(url));
+}
+function addKnowledgeParams(
+  url: URL,
+  params: Partial<KnowledgeSearchParams> & {
+    limit?: number;
+    memoryType?: KnowledgeMemoryType;
+  },
+): void {
+  if (params.q !== undefined) {
+    url.searchParams.set("q", params.q);
+  }
+  if (params.topK !== undefined) {
+    url.searchParams.set("top_k", String(params.topK));
+  }
+  if (params.zone) {
+    url.searchParams.set("zone", params.zone);
+  }
+  if (params.zones?.length) {
+    url.searchParams.set("zones", params.zones.join(","));
+  }
+  if (params.project) {
+    url.searchParams.set("project", params.project);
+  }
+  if (params.memoryType) {
+    url.searchParams.set("memory_type", params.memoryType);
+  }
+  if (params.includeMock !== undefined) {
+    url.searchParams.set("include_mock", String(params.includeMock));
+  }
+  if (params.includeSuperseded !== undefined) {
+    url.searchParams.set("include_superseded", String(params.includeSuperseded));
+  }
+  if (params.profile) {
+    url.searchParams.set("profile", params.profile);
+  }
+}
+export async function listProjects(): Promise<ProjectSummary[]> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects`));
+}
+export async function getProject(name: string): Promise<ProjectSummary> {
+  return jsonOrThrow(await fetch(`${BASE}/api/projects/${name}`));
+}
+export async function listEvents(limit = 80): Promise<EventEntry[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/events?limit=${limit}`));
+}
+
+export async function getRunTimeline(runId: string, limit = 500): Promise<TimelineItem[]> {
+  const url = apiUrl(`${BASE}/api/timeline/runs/${runId}`);
+  url.searchParams.set("limit", String(limit));
+  return jsonOrThrow(await fetch(url));
+}
+
+export async function getRunWorkLog(
+  runId: string,
+  agent?: string,
+  limit = 200,
+): Promise<WorkLogView> {
+  const url = apiUrl(`${BASE}/api/timeline/runs/${runId}/worklog`);
+  url.searchParams.set("limit", String(limit));
+  if (agent) {
+    url.searchParams.set("agent", agent);
+  }
+  return jsonOrThrow(await boundedFetch(url));
+}
+
+export async function getReportBundle(runId: string): Promise<ReportBundle> {
+  return jsonOrThrow(await fetch(`${BASE}/api/reports/${runId}`));
+}
+
+export async function regenerateReportBundle(runId: string): Promise<ReportBundle> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/reports/${runId}/regenerate`, {
+      method: "POST",
+    }),
+  );
+}
+
+export function reportFileUrl(runId: string, filename: string): string {
+  return `${BASE}/api/reports/${runId}/files/${encodeURIComponent(filename)}`;
+}
+
+export async function getConfigSnapshot(): Promise<ConfigSnapshot> {
+  return jsonOrThrow(await fetch(`${BASE}/api/config`));
+}
+
+export async function getAgentLlmConfig(): Promise<AgentLlmConfigView> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/config/agent-llm`));
+}
+
+export async function updateAgentLlmConfig(params: {
+  agents: AgentLlmUpdateRow[];
+  actor?: string;
+}): Promise<AgentLlmConfigView> {
+  return jsonOrThrow(
+    await boundedFetch(`${BASE}/api/config/agent-llm`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        agents: params.agents,
+        actor: params.actor ?? "frontend",
+      }),
+    }),
+  );
+}
+
+export async function validateConfigFile(
+  name: string,
+  text: string,
+): Promise<ConfigValidationResult> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/config/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, text }),
+    }),
+  );
+}
+
+export async function previewConfigDiff(
+  name: string,
+  text: string,
+): Promise<ConfigDiffResult> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/config/preview-diff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, text }),
+    }),
+  );
+}
+
+export async function applyConfigFile(params: {
+  name: string;
+  text: string;
+  actor?: string;
+  confirmHighRisk?: boolean;
+}): Promise<ConfigFile> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/config/apply`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: params.name,
+        text: params.text,
+        actor: params.actor ?? "user",
+        confirm_high_risk: params.confirmHighRisk ?? false,
+      }),
+    }),
+  );
+}
+
+export async function listExecutionPlots(runId: string): Promise<ExecutionPlot[]> {
+  return jsonOrThrow(await fetch(`${BASE}/api/execution/${runId}/plots`));
+}
+
+export function executionPlotUrl(plot: ExecutionPlot): string {
+  const url = plot.url.startsWith("http") ? plot.url : `${BASE}${plot.url}`;
+  return `${url}?v=${encodeURIComponent(String(plot.updated_at))}`;
+}
+
+// ---------- chat / Commander ----------
+export type ChatMessageView = {
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  timestamp: string;
+  state: string | null;
+  tool_name: string | null;
+  tool_args: Record<string, unknown> | null;
+  tool_result: Record<string, unknown> | null;
+};
+
+export type Conversation = {
+  continuation?: { enabled: boolean; source_message_id: string; token: string; message: string };
+  selected_model_id?: string;
+  processing?: boolean;
+  activities?: import("./researchActivity").CommanderActivity[];
+  conv_id: string;
+  project: string;
+  state: string;
+  linked_run_id: string | null;
+  experiment_id?: string;
+  auto_mode: boolean;
+  metric_targets: Record<string, number>;
+  messages: ChatMessageView[];
+};
+
+export type GlobalModelProfile = {
+  id: string; name: string; provider: string; model: string; base_url: string;
+  context_window: number; compatibility: "generic" | "qwen_200k" | "gemma_160k";
+  api_key_configured: boolean; configured: boolean;
+};
+export type GlobalModelProfiles = { default_id: string; profiles: GlobalModelProfile[] };
+export type SaveGlobalModelProfile = Omit<GlobalModelProfile, "id" | "configured" | "api_key_configured"> & { id?: string; api_key: string };
+
+export async function getGlobalModelProfiles(): Promise<GlobalModelProfiles> {
+  return jsonOrThrow(await fetch(`${BASE}/api/config/model-profiles`, { cache: "no-store" }));
+}
+export async function saveGlobalModelProfile(body: SaveGlobalModelProfile): Promise<GlobalModelProfile> {
+  return jsonOrThrow(await fetch(`${BASE}/api/config/model-profiles`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+  }));
+}
+export async function setConversationModel(convId: string, selectedModelId: string): Promise<Conversation> {
+  return jsonOrThrow(await fetch(`${BASE}/api/chat/conversations/${encodeURIComponent(convId)}/model`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selected_model_id: selectedModelId, make_default: true }),
+  }));
+}
+
+export async function createConversation(project = "pimc", experimentId = ""): Promise<Conversation> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/chat/conversations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(experimentId ? { project, experiment_id: experimentId } : { project }),
+    }),
+  );
+}
+
+export async function getConversation(convId: string): Promise<Conversation> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/chat/conversations/${convId}`));
+}
+
+export async function deleteConversation(convId: string): Promise<{ ok: boolean; recoverable: boolean }> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/chat/conversations/${encodeURIComponent(convId)}`, { method: "DELETE" }));
+}
+
+export async function restoreConversation(convId: string): Promise<Conversation> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/chat/conversations/${encodeURIComponent(convId)}/restore`, { method: "POST" }));
+}
+
+export class ChatMessageFailure extends Error {
+  constructor(message: string, public readonly messageSaved: boolean) { super(message); }
+}
+
+export type RecoveryAction = { action: "resume" | "retry"; node: string; label: string };
+export type CodeChange = { id: string; path: string; additions: number | null; deletions: number | null; change: string; status: string; source: string; timestamp: string; truncated: boolean; warning?: string };
+export type ApprovedCodeHistory = {
+  source?: string; approved?: boolean; historical?: boolean; current_mismatch?: boolean; execution_eligible?: boolean;
+  workspace?: { head: string; head_matches: boolean; clean: boolean; tracked_changes: boolean; untracked_files: boolean };
+};
+export type CodeChanges = ApprovedCodeHistory & { run_id: string; project: string; items: CodeChange[]; warnings: string[] };
+export type CodeChangeDetail = CodeChange & ApprovedCodeHistory & { run_id: string; project: string; lines: { kind: string; text: string; old_line: number | null; new_line: number | null }[] };
+export async function getCodeChanges(runId: string, project: string, signal?: AbortSignal): Promise<CodeChanges> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/code-changes?project=${encodeURIComponent(project)}`, { signal, cache: "no-store" }));
+}
+export async function getCodeChange(runId: string, project: string, id: string, signal?: AbortSignal): Promise<CodeChangeDetail> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/code-changes/${encodeURIComponent(id)}?project=${encodeURIComponent(project)}`, { signal, cache: "no-store" }));
+}
+export type RunRecovery = { run_id: string; project: string; status: string; message: string; token: string; actions: RecoveryAction[] };
+export async function getRunRecovery(runId: string, project: string, signal?: AbortSignal): Promise<RunRecovery> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/recovery?project=${encodeURIComponent(project)}`, { signal, cache: "no-store" }));
+}
+export async function recoverRun(runId: string, project: string, action: RecoveryAction, token: string): Promise<{ ok: boolean; status: string; message: string }> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/recovery`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project, ...action, token }),
+  }));
+}
+
+export async function sendChatMessage(convId: string, text: string): Promise<Conversation> {
+  const response = await fetch(`${BASE}/api/chat/conversations/${convId}/message`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+  if (!response.ok) {
+    const body = await response.text();
+    let messageSaved = false;
+    try {
+      const payload: unknown = JSON.parse(body);
+      messageSaved = isRecord(payload) && isRecord(payload.detail) && payload.detail.message_saved === true;
+    } catch { /* Unknown delivery status requires a refresh before resending. */ }
+    throw new ChatMessageFailure(errorDetailText(response.status, body), messageSaved);
+  }
+  return response.json() as Promise<Conversation>;
+}
+
+export async function continueConversation(convId: string, sourceMessageId: string, token: string): Promise<Conversation> {
+  const response = await fetch(`${BASE}/api/chat/conversations/${encodeURIComponent(convId)}/continue`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ source_message_id: sourceMessageId, token }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    let messageSaved = false;
+    try {
+      const payload: unknown = JSON.parse(body);
+      messageSaved = isRecord(payload) && isRecord(payload.detail) && payload.detail.message_saved === true;
+    } catch { /* Re-read the persisted conversation before another attempt. */ }
+    throw new ChatMessageFailure(errorDetailText(response.status, body), messageSaved);
+  }
+  return response.json() as Promise<Conversation>;
+}
+
+export async function setConversationAutoMode(
+  convId: string,
+  autoMode: boolean,
+): Promise<Conversation> {
+  return jsonOrThrow(
+    await fetch(`${BASE}/api/chat/conversations/${convId}/auto_mode`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ auto_mode: autoMode }),
+    }),
+  );
+}
+
+const BROWSER_ORIGIN = typeof window === "undefined" ? "" : window.location.origin;
+export const WS_BASE =
+  process.env.NEXT_PUBLIC_WS_URL ||
+  (CONFIGURED_BACKEND_URL || BROWSER_ORIGIN).replace(/^http/, "ws");
+
+export function researchSourceUrl(runId: string, sourceId: string): string {
+  const url = apiUrl(`${BASE}/api/artifacts/${encodeURIComponent(runId)}/idea/research-source`);
+  url.searchParams.set("source_id", sourceId);
+  return url.toString();
+}
+
+export interface IdeaMaterial {
+  id: string;
+  kind: "paper" | "context" | "code" | "research" | "search";
+  title: string;
+  status: string;
+  description: string;
+  provenance: string;
+  source_url: string;
+  source_id: string;
+  archive_available: boolean;
+  source_type: string;
+  decision: string;
+  reason: string;
+  transfer: string;
+  read_windows: string[];
+  preview_available: boolean;
+}
+
+export interface IdeaMaterialsView {
+  run_id: string;
+  items: IdeaMaterial[];
+  warnings: string[];
+}
+
+export async function getIdeaMaterials(runId: string, signal?: AbortSignal): Promise<IdeaMaterialsView> {
+  return jsonOrThrow(await fetch(`${BASE}/api/artifacts/${encodeURIComponent(runId)}/idea/materials`, { signal, cache: "no-store" }));
+}
+
+export async function getIdeaMaterialContent(runId: string, materialId: string, signal?: AbortSignal): Promise<{ id: string; title: string; text: string }> {
+  const url = apiUrl(`${BASE}/api/artifacts/${encodeURIComponent(runId)}/idea/material-content`);
+  url.searchParams.set("material_id", materialId);
+  return jsonOrThrow(await fetch(url, { signal, cache: "no-store" }));
+}
+
+export type ProjectContextDocument = { path: string; chars: number; sha256: string; role: string; is_template?: boolean };
+export type ProjectAutoContext = { project: string; folder: string; total_chars: number; files: ProjectContextDocument[]; warnings: string[] };
+export type ProjectFolders = { path: string; parent: string; directories: { name: string; path: string }[]; has_more: boolean };
+
+export async function openProjectFolder(path: string, create = false): Promise<ProjectSummary> {
+  return jsonOrThrow(await fetch(`${BASE}/api/projects/folder`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path, create }),
+  }));
+}
+export async function browseProjectFolders(path = "", signal?: AbortSignal): Promise<ProjectFolders> {
+  const url = apiUrl(`${BASE}/api/projects/folders`);
+  if (path) url.searchParams.set("path", path);
+  return jsonOrThrow(await fetch(url, { signal, cache: "no-store" }));
+}
+export async function getProjectAutoContext(project: string, signal?: AbortSignal): Promise<ProjectAutoContext> {
+  return jsonOrThrow(await fetch(`${BASE}/api/projects/${encodeURIComponent(project)}/auto-context`, { signal, cache: "no-store" }));
+}
+export async function getProjectContextDocument(project: string, path: string, signal?: AbortSignal): Promise<ProjectContextDocument & { content: string }> {
+  const url = apiUrl(`${BASE}/api/projects/${encodeURIComponent(project)}/auto-context/document`);
+  url.searchParams.set("path", path);
+  return jsonOrThrow(await fetch(url, { signal, cache: "no-store" }));
+}
+
+export async function uploadProjectBackground(project: string, file: File): Promise<ProjectContextDocument & { previous_path?: string }> {
+  const url = apiUrl(`${BASE}/api/projects/${encodeURIComponent(project)}/background`);
+  url.searchParams.set("filename", file.name);
+  return jsonOrThrow(await boundedFetch(url, { method: "POST", headers: { "Content-Type": "text/markdown; charset=utf-8" }, body: file }));
+}
+
+export type ModelConnectionResult = { ok: boolean; code: string; message: string; elapsed_ms: number; requested_model: string; configuration_saved: false };
+export async function importProjectCodeFolder(project: string, path: string): Promise<ProjectSummary> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/code-folder`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path }),
+  }));
+}
+
+export async function testModelConnection(params: { provider: string; model: string; base_url: string; api_key: string }, signal?: AbortSignal): Promise<ModelConnectionResult> {
+  const deadline = AbortSignal.timeout(CLIENT_POLICY.connectionTestTimeoutMs);
+  return jsonOrThrow(await fetch(`${BASE}/api/config/test-connection`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(params),
+    signal: signal ? AbortSignal.any([deadline, signal]) : deadline,
+  }));
+}
+
+export type RunActivityView = Pick<RunObservabilityView, "run_id" | "project" | "timeline">;
+export async function getRunActivity(runId: string): Promise<RunActivityView> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/activity`));
+}
+
+export type CodeDirectoryEntry = { path: string; name: string; kind: "directory" | "file"; size_bytes: number };
+export type CodeDirectory = { run_id: string; project: string; path: string; root_name: string; root_path: string; read_only: boolean; source: "project_current"; repository_token: string; entries: CodeDirectoryEntry[]; next_offset: number | null; total: number };
+export type CodeFilePage = { run_id: string; project: string; path: string; repository_token: string; source: "project_current"; version: string; start: number; total_lines: number; size_bytes: number; lines: string[]; next_start: number | null };
+export async function getCodeDirectory(runId: string, project: string, path: string, offset: number, token: string, signal?: AbortSignal): Promise<CodeDirectory> {
+  const query = new URLSearchParams({ project, path, offset: String(offset), repository_token: token });
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/code-repository?${query}`, { signal, cache: "no-store" }));
+}
+export async function getCodeFilePage(runId: string, project: string, path: string, start: number, token: string, version: string, signal?: AbortSignal): Promise<CodeFilePage> {
+  const query = new URLSearchParams({ project, path, start: String(start), repository_token: token, version });
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/runs/${encodeURIComponent(runId)}/code-repository/file?${query}`, { signal, cache: "no-store" }));
+}
+
+export type DataPipelineParameters = {
+  source_id: string; signal_key: string; reference_key: string;
+  sample_axis: 0 | 1; channel: number; fs_mhz: number; shift_mhz: number;
+  delay_samples: number; auto_align: boolean; reference_mode: "linear" | "cubic";
+  lowpass_mhz: number | null;
+};
+export type DataPipelineJob = {
+  id: string; project: string; status: string; error: string; summary: string; shared?: boolean;
+  params: DataPipelineParameters;
+  metrics: { input_shape: number[]; output_shape: number[]; rms_before: number; rms_after: number; warnings: string[]; spectrum_samples: number } | null;
+};
+export type DataPipelineField = { key: string; shape: number[]; dtype: string };
+function pipelineUrl(project: string): string { return `${BASE}/api/projects/${encodeURIComponent(project)}/data-pipeline`; }
+export async function listDataPipelineJobs(project: string, signal?: AbortSignal): Promise<DataPipelineJob[]> {
+  return jsonOrThrow(await boundedFetch(pipelineUrl(project), { signal, cache: "no-store" }));
+}
+export async function inspectDataPipelineSource(project: string, source: string, signal?: AbortSignal): Promise<DataPipelineField[]> {
+  return jsonOrThrow(await boundedFetch(`${pipelineUrl(project)}/fields/${encodeURIComponent(source)}`, { signal }));
+}
+export async function startDataPipeline(project: string, parameters: DataPipelineParameters): Promise<DataPipelineJob> {
+  return jsonOrThrow(await boundedFetch(pipelineUrl(project), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(parameters) }));
+}
+export async function dataPipelineAction(project: string, job: string, action: "analyze" | "share"): Promise<DataPipelineJob> {
+  return jsonOrThrow(await boundedFetch(`${pipelineUrl(project)}/${encodeURIComponent(job)}/${action}`, { method: "POST" }));
+}
+export function dataPipelineArtifact(project: string, job: string, name: string): string {
+  return `${pipelineUrl(project)}/${encodeURIComponent(job)}/files/${encodeURIComponent(name)}`;
+}
+
+// ------------------------------------------------------------- experiments
+export type ExperimentRun = { run_id: string; experiment_id: string; task: string; entrypoint: string; created_at: string };
+export type Experiment = {
+  id: string;
+  project: string;
+  name: string;
+  description: string;
+  created_at: string;
+  updated_at: string;
+  run_count: number;
+  latest_run_id: string | null;
+  latest_run_created_at: string | null;
+};
+export async function listProjectExperiments(project: string, signal?: AbortSignal): Promise<Experiment[]> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/experiments`, { signal, cache: "no-store" }));
+}
+export async function createProjectExperiment(project: string, name: string, description = ""): Promise<Experiment> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/experiments`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, description }),
+  }));
+}
+export async function getProjectExperimentRuns(project: string, experimentId: string, signal?: AbortSignal): Promise<ExperimentRun[]> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/experiments/${encodeURIComponent(experimentId)}/runs`, { signal, cache: "no-store" }));
+}
+
+// --------------------------------------------------------------- ainative
+export type AinativeCheck = { name: string; label: string; passed: boolean };
+export type AinativeDetection = { repo_path: string; is_native: boolean; checks: AinativeCheck[] };
+export type AinativeStep = { name: string; status: string; detail: string };
+export type AinativeJob = {
+  id: string;
+  project: string;
+  status: string;
+  created_at: string;
+  step: string;
+  error: string;
+  baseline_repo: string;
+  repo_path: string;
+  detection: AinativeDetection;
+  steps: AinativeStep[];
+};
+export type AinativeStatus = { project: string; has_job: boolean; job?: AinativeJob; detection: AinativeDetection };
+export async function detectAinative(project: string): Promise<AinativeDetection> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/ainative/detect`, { method: "POST" }));
+}
+export async function startAinativeGeneration(project: string): Promise<{ skipped: boolean; reason?: string; detection: AinativeDetection; job?: AinativeJob }> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/ainative/generate`, { method: "POST" }));
+}
+export async function getAinativeStatus(project: string, signal?: AbortSignal): Promise<AinativeStatus> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/ainative/status`, { signal, cache: "no-store" }));
+}
+
+// ---------------------------------------------------- project execution config
+export type ExecutionConfig = { schema: string; device: "local" | "remote_gpu"; remote_gpu?: Record<string, string>; updated_at?: string };
+export type ExecutionConfigStatus = ExecutionConfig & {
+  ready: boolean;
+  missing: string[];
+  findings: string[];
+  runtime_backend: string;
+  remote_capable_runtime: boolean;
+};
+export async function getExecutionConfig(project: string, signal?: AbortSignal): Promise<ExecutionConfig> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/execution-config`, { signal, cache: "no-store" }));
+}
+export async function saveExecutionConfig(project: string, payload: { device: "local" | "remote_gpu"; remote_gpu?: Record<string, string> }): Promise<ExecutionConfig> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/execution-config`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload),
+  }));
+}
+export async function getExecutionConfigStatus(project: string, signal?: AbortSignal): Promise<ExecutionConfigStatus> {
+  return jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/execution-config/status`, { signal, cache: "no-store" }));
+}
+
+export async function saveProjectModelReference(project: string, rows: AgentLlmConfigRow[]): Promise<void> {
+  const references = rows.map(({ agent, enabled, provider, model, api_key_env, base_url_env, temperature, max_tokens }) =>
+    ({ agent, enabled, provider, model, api_key_env, base_url_env, temperature, max_tokens }));
+  await jsonOrThrow(await boundedFetch(`${BASE}/api/projects/${encodeURIComponent(project)}/model-reference`, {
+    method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(references),
+  }));
+}

@@ -1,0 +1,79 @@
+execution:
+  device: cpu
+  backend: local_command
+  max_concurrency: 16
+  batch_steps: 120
+  command_timeout_seconds: 60
+  prepared_command_timeout_seconds: 86400
+  command_log_max_bytes: 1048576
+  command_output_tail_bytes: 8192
+  allow_real_patch_apply: true
+  paper_static:
+    enabled: false
+    python: python
+    repo_path: ''
+    config_path: configs/static.yaml
+    data_path: ''
+    default_dry_run: false
+    default_max_iters: 1
+    batch_experiments: 1
+    max_concurrency: 1
+    timeout_seconds: 900
+    allowed_overrides:
+    - Etotal
+    - Epoch
+    - epoch
+    - lr_init
+    - if_scheduler
+    - step_size
+    - model.lut_n_spline
+    - model.lut_rmax
+    - model.lut_init
+  local_commands: []
+  remote_gpu:
+    enabled: false
+    endpoint: ''
+    transport: system_ssh
+    auth_method: key
+    max_output_bytes: 1048576
+    protocol: remote_job.v1
+    runner: app.execution.remote.runner
+    env:
+      enabled: MARS_REMOTE_ENABLED
+      transport: MARS_REMOTE_SSH_TRANSPORT
+      auth_method: MARS_REMOTE_SSH_AUTH_METHOD
+      host_key_sha256: MARS_REMOTE_SSH_HOST_KEY_SHA256
+      host: MARS_REMOTE_SSH_HOST
+      port: MARS_REMOTE_SSH_PORT
+      user: MARS_REMOTE_SSH_USER
+      key_path: MARS_REMOTE_SSH_KEY_PATH
+      known_hosts: MARS_REMOTE_SSH_KNOWN_HOSTS
+      remote_root: MARS_REMOTE_ROOT
+      python: MARS_REMOTE_PYTHON
+      gpu_ids: MARS_REMOTE_GPU_IDS
+    connect_timeout_seconds: 10
+    command_timeout_seconds: 60
+    transfer_timeout_seconds: 900
+    heartbeat_stale_seconds: 600
+code_checks:
+  lint:
+    enabled: true
+    commands:
+    - id: python_compile
+      label: Python compile check
+      argv:
+      - python
+      - -m
+      - compileall
+      - -q
+      - .
+  test:
+    enabled: true
+    commands:
+    - id: pytest_quick
+      label: Pytest quick suite
+      argv:
+      - python
+      - -m
+      - pytest
+      - -q

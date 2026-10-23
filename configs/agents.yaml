@@ -1,0 +1,332 @@
+commander:
+  enabled: true
+  output_schema: ''
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.2
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 2
+      base_delay_seconds: 1
+  debate:
+    enabled: false
+  role: supervisor_react
+  loop:
+    max_tool_steps: 12
+  tools:
+  - code.repo_list
+  - code.repo_search
+  - code.repo_read_lines
+  - run.existing_model
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+  - run.create
+  - run.auto_research
+  - run.start
+  - run.status
+  - run.recovery_status
+  - run.recover
+  - run.feedback_loop
+  - artifact.read
+  - artifact.review
+  - metrics.evaluate
+  - diagnosis.failure_analysis
+  - user.approval
+idea:
+  enabled: true
+  output_schema: proposal.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.7
+    max_tokens: 8192
+    top_p: 1.0
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 2
+      base_delay_seconds: 1
+  debate:
+    enabled: false
+    rounds: 1
+    participants:
+    - role: proposer
+      provider: zhipu
+      model: glm-5.3
+    - role: critic
+      provider: zhipu
+      model: glm-5.3
+    - role: judge
+      provider: zhipu
+      model: glm-5.3
+  research:
+    max_delegations: 2
+    required_tools: true
+    enable_network: true
+    source_downloads: true
+    source_download_limit: 1
+    web_search: true
+  loop:
+    protocol: native_tools
+    native_observation_history: true
+    mode: reflection
+    trace: full
+    reflection_thinking_enabled: true
+    reflection_reasoning_effort: low
+    reflection_format_repair_enabled: false
+    input_token_budget: 128000
+    max_model_calls: 36
+    max_validation_repairs: 6
+    max_tool_steps: 18
+  tools:
+  - idea.research_delegate
+  - search.local_docs
+  - search.arxiv_search
+  - search.web_search
+  - search.fetch_sources
+  - knowledge.kb_query
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+  - knowledge.baseline_match
+  - code.repo_reader
+idea_research:
+  enabled: true
+  output_schema: research_report.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.2
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 1
+      base_delay_seconds: 1
+  research:
+    excerpt_context_chars: 600
+    review_mode: whole_report
+  debate:
+    enabled: false
+  loop:
+    protocol: native_tools
+    native_observation_history: true
+    mode: reflection
+    reflection_thinking_enabled: true
+    reflection_reasoning_effort: low
+    reflection_format_repair_enabled: false
+    max_reflections: 2
+    trace: full
+    input_token_budget: 128000
+    observation_chars: 16000
+    max_model_calls: 16
+    max_tool_steps: 12
+    max_validation_repairs: 3
+  tools:
+  - search.openalex_search
+  - search.arxiv_search
+  - search.web_search
+  - search.fetch_sources
+  - search.local_docs
+  - knowledge.kb_query
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+  - knowledge.baseline_match
+experiment:
+  enabled: true
+  output_schema: experiment_plan.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.3
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 2
+      base_delay_seconds: 1
+  debate:
+    enabled: false
+  loop:
+    input_token_budget: 128000
+    max_validation_repairs: 1
+    max_tool_steps: 8
+  tools:
+  - knowledge.kb_query
+  - knowledge.baseline_match
+  - knowledge.experiment_memory
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+coding:
+  enabled: true
+  output_schema: code_spec.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.1
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 2
+      base_delay_seconds: 1
+  post_training:
+    enabled: false
+    mode: endpoint
+    endpoint_provider: local_vllm
+    adapter_path: ''
+    custom_endpoint: http://127.0.0.1:8001/v1
+    model: mars-coding-posttrain
+    api_key_env: LOCAL_VLLM_API_KEY
+    fine_tuned_model_id: ''
+    live_checkpoint_path: ''
+  language_tracks:
+  - python_research
+  - c_production
+  loop:
+    completion_driven: true
+    protocol: native_tools
+    mode: react
+    native_observation_history: true
+    input_token_budget: 128000
+    max_validation_repairs: 2
+    max_tool_steps: 20
+  tools:
+  - code.repo_reader
+  - code.patch_generator
+  - code.apply_patch
+  - code.write_file
+  - code.delete_file
+  - code.rollback_patch
+  - code.test_runner
+  - code.prepare_execution
+  - code.lint
+  - knowledge.code_assets
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+  - code.copy_yaml
+execution:
+  enabled: true
+  output_schema: run_log.v1
+  runtime_mode: deterministic
+  debate:
+    enabled: false
+  loop:
+    input_token_budget: 128000
+    max_validation_repairs: 1
+    max_tool_steps: 6
+  tools:
+  - execution.log_streamer
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+  - execution.metrics_collector
+writing:
+  enabled: true
+  output_schema: report.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.4
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 2
+      base_delay_seconds: 1
+  debate:
+    enabled: false
+    rounds: 1
+    participants:
+    - role: critic
+      provider: zhipu
+      model: glm-5.3
+    - role: positive_reviewer
+      provider: zhipu
+      model: glm-5.3
+  loop:
+    protocol: native_tools
+    native_observation_history: true
+    mode: reflection
+    input_token_budget: 128000
+    max_validation_repairs: 1
+    max_tool_steps: 8
+  tools:
+  - knowledge.methodology
+  - knowledge.run_archive
+  - knowledge.research_memory
+  - knowledge.research_memory_read
+  - code.repo_reader
+idea_author:
+  enabled: true
+  output_schema: proposal.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.2
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 1
+      base_delay_seconds: 1
+  debate:
+    enabled: false
+  tools: []
+idea_reviewer:
+  enabled: true
+  output_schema: proposal.v1
+  model:
+    context_window: 128000
+    provider: zhipu
+    model: glm-5.3
+    temperature: 0.1
+    max_tokens: 8192
+    api_key_env: ZHIPU_API_KEY
+    base_url: https://open.bigmodel.cn/api/paas/v4
+    thinking:
+      enabled: true
+    reasoning_effort: low
+    request_timeout_seconds: 720
+    retry:
+      max_retries: 0
+      base_delay_seconds: 1
+  debate:
+    enabled: false
+  tools: []

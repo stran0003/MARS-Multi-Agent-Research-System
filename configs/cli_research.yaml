@@ -1,0 +1,49 @@
+schema: cli_research.config.v1
+adapter: pimc_static
+source_config: configs/static_cpu_50steps.yaml
+source_paths: [libs, tools, configs, AGENTS.md, README.md, docs, context, data/static/README.md]
+optional_context_files:
+  - context/**/*.md
+  - docs/PIMC_BACKGROUND.md
+context_files:
+  - AGENTS.md
+  - data/static/README.md
+  - configs/static.yaml
+  - libs/model.py
+  - libs/model_static_compact.py
+  - tools/train_static_compression.py
+reduction: 0.20
+max_degradation_db: 0.0
+rounds: 3
+max_steps: 50
+timeout_seconds: 1800
+candidate_path: libs/research_candidate.py
+source_domains: [arxiv.org, export.arxiv.org, openreview.net, proceedings.neurips.cc, openaccess.thecvf.com, api.openalex.org, doi.org]
+# CLI generation favors bounded visible delivery; the focused cross-model
+# reviewer retains its separately configured thinking and acceptance checks.
+research_author:
+  thinking_enabled: true
+  reasoning_effort: low
+  max_tokens: 8192
+  request_timeout_seconds: 720
+  max_retries: 1
+generation:
+  thinking_enabled: true
+  reasoning_effort: low
+  max_tokens: 8192
+  request_timeout_seconds: 720
+  max_retries: 1
+coding_loop:
+  protocol: native_tools
+  mode: reflection
+  native_observation_history: true
+  trace: full
+  max_model_calls: 12
+  max_tool_steps: 0
+  max_validation_repairs: 3
+  max_reflections: 2
+  # NativeAgentLoop counts UTF-8 bytes as a conservative token upper bound.
+  # Reserve room for full source, proposal, previous code and validation repairs.
+  input_token_budget: 48000
+  observation_chars: 24000
+  author_empty_completion_repair_enabled: true

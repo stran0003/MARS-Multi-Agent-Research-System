@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mars"
+version = "0.1.0"
+description = "MARS - Multi-Agent Research System (V0)"
+requires-python = ">=3.11"
+authors = [{ name = "Harry" }]
+dependencies = [
+  "fastapi>=0.111",
+  "uvicorn[standard]>=0.30",
+  "python-socketio>=5.11",
+  "pydantic>=2.6",
+  "pydantic-settings>=2.2",
+  "loguru>=0.7",
+  "pyyaml>=6.0",
+  "jsonschema>=4.21",
+  "python-frontmatter>=1.1",
+  "httpx>=0.27",
+  "aiohttp>=3.11,<4", # Private loopback model/MCP bridge for the ZCode process.
+  "redis>=5.0",
+  "chromadb>=0.5",
+  "numpy>=1.26",
+  "anthropic>=0.34",
+  "openai>=1.40",
+  "langgraph>=0.2.0",
+  "pypdf[fonts]>=6.17",
+  "socksio>=1.0.0",
+  "filelock>=4.0.1,<5",
+  "asyncssh[bcrypt]>=2.24,<3",
+  "tensorboard>=2.16",
+  "protobuf<7",
+  "openpyxl>=3.1,<4", # Editable report workbooks and native charts.
+  "python-docx>=1.1,<2", # Full report documents with native headings and tables.
+  "mistune>=3.0,<4", # Parse report Markdown without dropping structured content.
+  "pillow>=10,<13", # Preserve source plot aspect ratios in Office exports.
+]
+
+[project.scripts]
+mars = "app.cli:main"
+
+[project.optional-dependencies]
+pimc = ["torch>=2.2,<3", "scipy>=1.12", "matplotlib>=3.8", "seaborn>=0.13,<1"]
+dev = [
+  "pytest>=8.0",
+  "pytest-asyncio>=0.23",
+  "pytest-cov>=5.0",
+  "mypy>=1.10",
+  "import-linter>=2.0",
+  "types-PyYAML",
+  "types-jsonschema",
+  "types-redis",
+  "types-openpyxl",
+]
+
+[tool.setuptools.packages.find]
+where = ["backend"]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+asyncio_mode = "auto"
+addopts = "-ra -q"
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "backend:projects/synthetic_regression/src"
+namespace_packages = true
+explicit_package_bases = true
+exclude = [
+  "frontend/",
+  "build/",
+  ".venv/",
+  "workspace/",
+  "knowledge/",
+  "runs/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+  "chromadb.*",
+  "langgraph.*",
+  "frontmatter",
+  "socketio.*",
+  "anthropic.*",
+  "openai.*",
+  "matplotlib.*",
+  "tensorboard.*",
+  "torch.*",  # Optional PIMC extra; the core installation does not include PyTorch.
+]
+ignore_missing_imports = true

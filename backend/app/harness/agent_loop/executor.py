@@ -1,0 +1,1013 @@
+"""Native bounded ReAct/Reflection engine; framework adapters implement one Protocol."""
+from __future__ import annotations
+
+import asyncio
+import json
+import traceback
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import Any, Literal, Protocol
+
+from app.harness.agent_loop.context import compact, pack_context
+from app.harness.agent_loop.completion_recovery import apply_author_empty_completion_recovery, validate_author_empty_recovery_resume
+from app.harness.agent_loop.provider_rejection_resume import checkpoint_quota_rejection_receipt
+from app.harness.agent_loop.interrupted_model_resume import checkpoint_interrupted_model_receipt
+from app.harness.agent_loop.native_protocol import INSTRUCTION as NATIVE_INSTRUCTION, history_groups, native_decision, native_specs
+from app.harness.agent_loop.policy import AgentLoopPolicy
+from app.harness.agent_loop.review import ExternalReview, review_revision
+from app.harness.agent_loop.revision_seed import RevisionSeed
+from app.harness.agent_loop.review_plan import (
+    WHOLE_REVIEW_UNIT, ReviewPlan, ReviewPlanFactory, ReviewUnit, UnitReviewResult, completed_plan_decision, finish_review_unit, pack_review_unit,
+    prepare_review_plan, remaining_budget_message, review_plan_fingerprint, review_unit_config,
+    start_review_unit, validate_review_plan_resume, validate_review_provider,
+    format_correction_message, queue_review_format_correction,
+)
+from app.harness.agent_loop.protocol import INSTRUCTION, ReviewConflictError, action_protocol_feedback, invalid_output_context, is_review_format_error, parse_action, parse_review
+from app.harness.agent_loop.trace import LoopTrace, atomic_json, canonical, digest
+from app.harness.agent_loop.stop import StopCondition, evaluate_stop, stop_fingerprint
+from app.harness.llm.model_capabilities import ModelCompatibilityError, requires_glm_thinking
+from app.harness.llm.provider_base import LLMCompletionError, LLMConfig, LLMProvider, Message, llm_call_deadline_seconds
+from app.harness.llm.accounting import ResourceBudgetError, guarded_complete
+from app.harness.llm.structured_output import normalize_document_output
+from app.harness.tools.registry import ToolContext, ToolPolicy, ToolRegistry
+
+Validator = Callable[[str, list[dict[str, Any]]], Awaitable[list[str]]]
+ProgressSink = Callable[[dict[str, Any]], Awaitable[None]]
+CONTEXT_FORMAT_VERSION = 10
+
+
+def generation_fingerprint(config: LLMConfig, provider: LLMProvider) -> str:
+    """Bind generation/retry controls and the actual endpoint, never credentials.
+
+    Only the digest is persisted. The runtime callback is not generation input;
+    every other configuration field (including provider-specific extras) is.
+    """
+    configuration = {item.name: getattr(config, item.name) for item in fields(config)
+                     if item.name != "attempt_observer"}
+    return digest({"configuration": configuration,
+                   "implementation": type(provider).__module__ + "." + type(provider).__qualname__,
+                   "endpoint_sha256": digest(provider.base_url)})
+
+
+def truncation_recovery(reason: object, *, repairs: int, limit: int, effort: str | None) -> dict[str, Any] | None:
+    """Plan a bounded repair from public error metadata, never from partial output."""
+    if not isinstance(reason, dict) or reason.get("code") != "output_truncated" or repairs >= limit:
+        return None
+    selected = "low" if effort in {"medium", "high", "max"} else effort
+    return {"previous_effort": effort, "reasoning_effort": selected,
+            "feedback": "The last response hit the output token limit and was rejected. "
+                        "Reasoning may consume this same limit. Produce a concise complete JSON response; "
+                        "retain required equations, parameter accounting and evidence, remove repetition. "
+                        "Existing observations remain valid; do not repeat research without a specific evidence gap."}
+
+
+@dataclass
+class LoopInput:
+    messages: list[Message]
+    provider: LLMProvider
+    config: LLMConfig
+    registry: ToolRegistry
+    tool_context: ToolContext
+    tools: tuple[str, ...]
+    policy: AgentLoopPolicy
+    trace_root: Path
+    validate: Validator
+    reflection_rubric: str = "Check evidence, definitions, arithmetic, internal consistency and falsifiability."
+    resume: bool = False
+    external_review: ExternalReview | None = None
+    progress_sink: ProgressSink | None = None
+    review_messages: list[Message] | None = None
+    final_schema: dict[str, Any] | None = None
+    required_review_tools: tuple[str, ...] = ()
+    stop_condition: StopCondition | None = None
+    stop_contract_id: str | None = None
+    review_plan_factory: ReviewPlanFactory | None = None
+    review_plan_contract_id: str | None = None
+    review_provider: LLMProvider | None = None
+    review_config: LLMConfig | None = None
+    correlation: dict[str, str] = field(default_factory=dict)
+    context_metadata: dict[str, Any] = field(default_factory=dict)
+    revision_seed: RevisionSeed | None = None
+    session_continuation: dict[str, Any] | None = None
+
+
+@dataclass
+class LoopResult:
+    text: str
+    status: str
+    observations: list[dict[str, Any]]
+    counts: dict[str, int]
+    trace_root: Path
+    reflection_accepted: bool = False
+    resource_error: str = ""
+
+
+class AgentLoopExecutor(Protocol):
+    async def run(self, request: LoopInput) -> LoopResult: ...
+
+
+def budget_message(policy: AgentLoopPolicy, counts: dict[str, int]) -> Message:
+    """Expose actual remaining local resources before choosing another action."""
+    remaining = {"model_calls": policy.remaining_model_calls(counts["model_requests"]),
+                 "tool_calls": policy.remaining_tool_calls(counts["tool_dispatches"]),
+                 "validation_repairs": None if policy.completion_driven else max(0, policy.max_validation_repairs - counts["validation_repairs"])}
+    message = remaining_budget_message(remaining)
+    from app.harness.agent_loop.review_plan import SHARED_BUDGET_NOTICE
+
+    return Message(message.role, message.content + SHARED_BUDGET_NOTICE)
+
+
+def permits_fresh_read(policy: ToolPolicy) -> bool:
+    """Only host-configured local reads can bypass successful-call deduplication."""
+    return bool(policy.repeatable_read and policy.mutation_level == "read"
+                and not policy.network and not policy.requires_approval)
+
+
+def rejected_batch_feedback(actions: list[dict[str, Any]], *, seen: dict[str, Any],
+                            history: list[dict[str, Any]], policy: AgentLoopPolicy, used: int) -> str:
+    """Identify rejected actions and return their actual prior observations."""
+    identities = [digest({"tool": action["tool"], "args": action["args"]}) for action in actions]
+    prior = {digest({"tool": item["tool"], "args": item["args"]}): item for item in history}
+    completed = [identity for identity in dict.fromkeys(identities)
+                 if identity in seen and not seen[identity]["retry_allowed"]]
+    return canonical({"batch_not_executed": True,
+        "remaining_tool_calls": policy.remaining_tool_calls(used),
+        "over_budget": not policy.allows_tool_calls(used, len(actions)),
+        "duplicate_within_batch": [action for index, action in enumerate(actions) if identities[index] in identities[:index]],
+        "prior_observations_untrusted": [compact(prior[identity], policy.observation_chars) for identity in completed if identity in prior],
+        "not_executed": [{"tool": action["tool"], "args": action["args"]} for action in actions],
+        "instruction": "No action in this batch ran. Reuse the actual prior observations shown here, even if their old context was offloaded. "
+            "Use context.read_material for missing archived windows. Submit only new needed actions within budget; "
+            "do not include already completed/permanent-failed calls in the next batch."})
+
+
+def action_instructions(specs: list[dict[str, Any]], *, native: bool,
+                        final_schema: dict[str, Any] | None) -> str:
+    """Expose the same submission contract through either action protocol."""
+    if native:
+        return NATIVE_INSTRUCTION
+    instructions = INSTRUCTION + "\nTools:\n" + canonical(specs)
+    if final_schema is not None:
+        instructions += "\nComplete final.metadata JSON Schema:\n" + canonical(final_schema)
+    return instructions
+
+
+def validate_reflection_format_repair(config: LLMConfig, policy: AgentLoopPolicy) -> None:
+    if not policy.reflection_format_repair_enabled:
+        return
+    if config.provider != "deepseek":
+        raise ValueError("reflection_format_repair_enabled currently requires DeepSeek")
+    normal_thinking = (policy.reflection_thinking_enabled
+                       if policy.reflection_thinking_enabled is not None else config.thinking_enabled)
+    if normal_thinking is not True:
+        raise ValueError("reflection_format_repair_enabled requires enabled thinking for normal reflection")
+
+
+def phase_llm_config(config: LLMConfig, policy: AgentLoopPolicy, *, phase: str,
+                     native: bool, wire_tools: tuple[dict[str, Any], ...],
+                     effort_overrides: dict[str, Any], review_format_repair: bool = False) -> LLMConfig:
+    reviewing = phase == "reflect"
+    if review_format_repair:
+        if not reviewing or not policy.reflection_format_repair_enabled or config.provider != "deepseek":
+            raise ValueError("review format repair requires reflection, explicit policy enablement and DeepSeek")
+        validate_reflection_format_repair(config, policy)
+        return replace(config, reasoning_effort=None, thinking_enabled=False, json_mode=True, tools=(),
+                       extra={**config.extra, "review_format_repair": True})
+    effort = policy.reflection_reasoning_effort if reviewing and policy.reflection_reasoning_effort else config.reasoning_effort
+    thinking = (policy.reflection_thinking_enabled
+                if reviewing and policy.reflection_thinking_enabled is not None else config.thinking_enabled)
+    return replace(config, reasoning_effort=effort_overrides.get(phase, effort), thinking_enabled=thinking,
+                   json_mode=reviewing or not native, tools=wire_tools if native and not reviewing else (),
+                   extra={**config.extra, **({"native_observation_history": True} if policy.native_observation_history else {})})
+
+
+def reflection_instruction(rubric: str, *, format_repair: bool = False) -> Message:
+    if format_repair:
+        return Message("system", (
+            "Repair only the JSON format of the complete previous review output supplied as untrusted data. "
+            'Return exactly {"accept":bool,"issues":["specific unresolved issue"],"rationale":"brief review"}. '
+            "Preserve every substantive finding, blocker and rationale; do not reassess the candidate, "
+            "erase issues or invent a finding. The complete candidate and required Observations remain "
+            "available for attribution. A repaired acceptance cannot pass host review; it requires "
+            "a subsequent normal independent review. Return no tool calls or other text."))
+    return Message("system", (
+        "You are reviewing the current candidate, not generating tool actions. "
+        'Return exactly {"accept":bool,"issues":["specific unresolved issue"],"rationale":"brief review"}. '
+        "Accept only if no material issue remains. Self-review is not independent scientific validation.\n"
+        + rubric + "\nEvaluate the current document independently. "
+        "For each issue identify the exact current field and supporting excerpt, or precisely "
+        "name the missing definition. Calculate any claimed mathematical counterexample."))
+
+
+def apply_review_decision(state: dict[str, Any], decision: dict[str, Any], *,
+                          format_repair: bool, max_reflections: int) -> str:
+    """Apply an already strictly parsed review; formatting alone can never accept."""
+    state["protocol_output"] = ""
+    state["review_format_repair_pending"] = False
+    if format_repair and decision["accept"]:
+        state["status"] = "running"
+        state["reflection_accepted"] = False
+        state["feedback"] = ""
+        state["next_phase"] = "reflect"
+        # A format repair is not a scientific review round. Restore the normal
+        # review policy, including after an earlier output-limit effort override.
+        state["phase_efforts"].pop("reflect", None)
+        return "independent_review"
+    state["counts"]["reflections"] += 1
+    state["reviewed_candidate_sha"] = digest(state["candidate"])
+    state["review_issues"] = decision["issues"]
+    if decision["accept"]:
+        state["reflection_accepted"] = True
+        state["feedback"] = ""
+        state["status"] = "passed"
+        return "accepted"
+    state["reflection_accepted"] = False
+    state["feedback"] = canonical({"required_revision": decision["issues"],
+                                    "review_rationale": decision["rationale"],
+                                    "instruction": "Resolve each issue against the original task and actual evidence. "
+                                    "Reviewer claims are unverified: calculate alleged counterexamples before changing a correct method. "
+                                    "Update all affected fields or provide a precise evidence-backed rebuttal in the revised candidate. "
+                                    "Do not relax user constraints or merely remove warnings."})
+    state["next_phase"] = "act"
+    if state["counts"]["reflections"] >= max_reflections:
+        state["status"] = "reflection_rejected"
+    return "revision"
+
+
+def apply_planned_review_decision(state: dict[str, Any], result: UnitReviewResult, *, response_text: str,
+                                  response_visible: Any, max_reflections: int) -> tuple[dict[str, Any], str]:
+    """Commit unit and candidate transitions together, before any notification await."""
+    record = finish_review_unit(state, result, response_text=response_text, response_visible=response_visible)
+    decision = completed_plan_decision(state["review_plan"])
+    if decision is None:
+        return record, "next_unit"
+    outcome = apply_review_decision(state, decision, format_repair=False, max_reflections=max_reflections)
+    return record, outcome
+
+
+def apply_loop_cancellation(state: dict[str, Any]) -> bool:
+    """Interrupt unfinished work; notification cancellation cannot reopen a terminal outcome."""
+    if state["status"] != "running":
+        return False
+    state["status"] = "interrupted"
+    if state["pending"] == "model":
+        state["usage_complete"] = False
+    return True
+
+
+def missing_review_evidence(history: list[dict[str, Any]], manifest: dict[str, Any],
+                            required_tools: tuple[str, ...], *, observation_chars: int) -> list[str]:
+    """Refuse review when required real tool evidence was compressed or omitted."""
+    hidden = set(manifest.get("compressed_history", [])) | set(manifest.get("omitted_history", []))
+    preserved = set(manifest.get("preserved_review_history", []))
+    missing: list[str] = []
+    for index, group in enumerate(history_groups(history)):
+        for item in group:
+            if item.get("tool") in required_tools and item.get("ok"):
+                if index in hidden or (index not in preserved and compact(item, observation_chars) != item):
+                    missing.append(str(item["tool"]) + " history group " + str(index))
+    return missing
+
+
+def validate_native_thinking(config: LLMConfig, policy: AgentLoopPolicy) -> None:
+    """Permit thinking tools only with a supported, public-observation history."""
+    if policy.protocol != "native_tools":
+        return
+    glm_thinking = requires_glm_thinking(config.provider, config.model)
+    if config.thinking_enabled is False:
+        if glm_thinking:
+            raise ModelCompatibilityError("GLM-5.3 requires thinking enabled; use reasoning_effort=low")
+        return
+    if not policy.native_observation_history:
+        raise ModelCompatibilityError("native thinking tools require observation-only history")
+
+
+class NativeAgentLoop:
+    async def run(self, request: LoopInput) -> LoopResult:
+        p = request.policy
+        if (request.review_provider is None) != (request.review_config is None):
+            raise ValueError("review provider and configuration must be supplied together")
+        validate_reflection_format_repair(request.review_config or request.config, p)
+        specs = []
+        fresh_reads: set[str] = set()
+        for name in request.tools:
+            spec = request.registry.spec(name)
+            if not request.registry.has(name) or spec is None or spec.bridge_only:
+                raise ValueError(f"configured tool has no executable specification: {name}")
+            specs.append({"name": name, "description": spec.description, "args_schema": spec.input_schema})
+            if permits_fresh_read(spec.policy):
+                fresh_reads.add(name)
+        native = p.protocol == "native_tools"
+        validate_native_thinking(request.config, p)
+        wire_tools = native_specs(specs, request.final_schema, allow_revisions=p.document_revisions_enabled,
+                                  body_field=p.submission_body_field) if native else ()
+        tool_schema_budget = len(canonical(wire_tools).encode("utf-8")) if native else 0
+        instructions = action_instructions(specs, native=native, final_schema=request.final_schema)
+        pinned = list(request.messages) + [Message(role="system", content=instructions)]
+        fingerprint = digest({"messages": [x.to_wire() for x in pinned], "policy": p.fingerprint_data(),
+                              "generation": generation_fingerprint(request.config, request.provider),
+                              "project": request.tool_context.project, "tools": specs,
+                              "context_format_version": CONTEXT_FORMAT_VERSION})
+        if native:
+            fingerprint = digest({"base": fingerprint, "wire_tools": wire_tools})
+        if request.review_config is not None:
+            assert request.review_provider is not None
+            fingerprint = digest({"base": fingerprint, "review_generation": generation_fingerprint(
+                request.review_config, request.review_provider)})
+        if request.required_review_tools:
+            fingerprint = digest({"base": fingerprint, "required_review_tools": request.required_review_tools})
+        if request.review_messages is not None:
+            fingerprint = digest({"base": fingerprint, "review_messages": [m.to_wire() for m in request.review_messages]})
+        if request.final_schema is not None:
+            fingerprint = digest({"base": fingerprint, "final_schema": request.final_schema})
+        if request.revision_seed is not None:
+            if not native or not p.document_revisions_enabled or p.trace != "full":
+                raise ValueError("revision seeds require native document revisions with full trace")
+            fingerprint = digest({"base": fingerprint, "revision_seed": request.revision_seed.receipt})
+        fingerprint = stop_fingerprint(fingerprint, request.stop_condition, request.stop_contract_id)
+        fingerprint = review_plan_fingerprint(fingerprint, request.review_plan_factory, request.review_plan_contract_id,
+                                              request.config, p)
+        if request.review_plan_factory is not None:
+            validate_review_provider(request.provider, configured_provider=request.config.provider)
+            fingerprint = digest({"base": fingerprint, "reflection_rubric": request.reflection_rubric})
+        runtime_policy = request.context_metadata.get("runtime_policy", {})
+        modern_context = runtime_policy.get("version") == 3
+        if modern_context:
+            fingerprint = digest({"base": fingerprint, "runtime_policy": runtime_policy,
+                                  "materials": request.context_metadata.get("materials", {})})
+        correlation = dict(request.correlation)
+        correlation.setdefault("invocation_id", request.trace_root.name)
+        correlation.setdefault("trace_id", request.tool_context.run_id)
+        correlation.setdefault("node_id", request.tool_context.agent)
+        trace = LoopTrace(request.trace_root, p.trace, resume=request.resume, correlation=correlation)
+        state: dict[str, Any] = {
+            "fingerprint": fingerprint, "context_format_version": CONTEXT_FORMAT_VERSION,
+            "status": "running", "pending": None,
+            "counts": {k: 0 for k in ("model_requests", "model_responses", "tool_dispatches",
+                                     "observations", "sdk_attempts", "action_rounds", "protocol_repairs",
+                                     "validation_repairs", "reflections")},
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage_complete": True, "history": [], "candidate": "", "feedback": "",
+            "next_phase": "act", "seen": {}, "reflection_accepted": False,
+            "review_issues": [], "reviewed_candidate_sha": "",
+            "correlation": correlation, "context_metadata": request.context_metadata,
+        }
+        if request.review_plan_factory is not None:
+            state["review_plan_contract_id"] = request.review_plan_contract_id
+        if request.revision_seed is not None and not request.resume:
+            from copy import deepcopy
+            state["candidate"] = request.revision_seed.candidate
+            state["history"] = deepcopy(list(request.revision_seed.observations))
+            state["revision_seed"] = deepcopy(request.revision_seed.receipt)
+            state["feedback"] = (
+                "This is an explicit human-requested revision of the current unapproved candidate. "
+                "Use mars_revise_document with its receipt to change only the required fields. "
+                "Historical readings carry their actual source receipts; do not repeat research without a gap. "
+                "Read current code again. The complete revised candidate still requires validation and independent review."
+            )
+        rejection_receipt = None
+        interrupted_receipt = None
+        if request.resume:
+            if p.trace != "full":
+                raise ValueError("resume requires full trace/checkpoint mode")
+            state = json.loads((request.trace_root / "checkpoint.json").read_text())
+            if state.get("context_format_version") != CONTEXT_FORMAT_VERSION:
+                raise ValueError("resume checkpoint context format is incompatible; use its original runtime "
+                                 "to resume it; automatic replay with this runtime is forbidden")
+            allowed_status = {"running", "interrupted", "model_error"}
+            if request.external_review:
+                allowed_status.add("passed")
+                review_revision(state, request.external_review, p)
+            if state["fingerprint"] != fingerprint or state["status"] not in allowed_status:
+                raise ValueError("resume requires identical inputs/configuration and an interrupted/model-error run")
+            rejection_receipt = checkpoint_quota_rejection_receipt(request.trace_root, state,
+                run_root=Path(str(request.tool_context.extra.get("run_root") or request.trace_root.parent)))
+            interrupted_receipt = checkpoint_interrupted_model_receipt(request.trace_root, state,
+                run_root=Path(str(request.tool_context.extra.get("run_root") or request.trace_root.parent)))
+            if rejection_receipt is not None:
+                # An explicit rejection has no unknown result to replay. Keep
+                # all request/attempt counts and unknown token usage unchanged.
+                state["pending"] = None
+            elif interrupted_receipt is not None:
+                # Preserve prior observations/counts; only the lost generation
+                # is abandoned. Its partial bytes cannot become an action.
+                state["pending"] = None
+                state["usage_complete"] = False
+            elif state.get("pending") == "model":
+                raise ValueError("model outcome unknown: reconcile the original request before resuming")
+            validate_author_empty_recovery_resume(state, p)
+            if request.review_plan_contract_id is not None:
+                validate_review_plan_resume(state, request.trace_root, contract_id=request.review_plan_contract_id)
+            if state.get("pending_batch"):
+                raise ValueError("incomplete batch: reconcile tool receipts before resuming; automatic replay forbidden")
+            if state["pending"] == "tool":
+                raise ValueError("tool outcome unknown: reconcile its receipt before resuming; automatic replay forbidden")
+            if state["pending"] == "model":
+                state["usage_complete"] = False
+            state["status"] = "running"
+            state.pop("resource_error", None)
+            state["pending"] = None
+        state.setdefault("review_issues", [])
+        state.setdefault("validation_issues", [])
+        state.setdefault("protocol_output", "")
+        state.setdefault("reviewed_candidate_sha", "")
+        state.setdefault("phase_efforts", {})
+        state.setdefault("review_format_repair_pending", False)
+        async def progress(kind: str, **payload: Any) -> None:
+            if request.progress_sink is not None:
+                try:
+                    await request.progress_sink({"kind": kind, "phase": state["next_phase"], **payload})
+                except asyncio.CancelledError:
+                    if state["status"] == "running":
+                        raise
+                    # Delivery cancellation after durable completion cannot
+                    # replace a known final outcome or force another review.
+                    trace.emit("progress_cancelled_after_completion", {"progress_kind": kind, "status": state["status"]})
+                    trace.snapshot(state)
+        if request.resume and "last_model_error" not in state:
+            prior_events = [json.loads(line) for line in trace.events.read_text().splitlines()]
+            state["last_model_error"] = next((row.get("reason") for row in reversed(prior_events)
+                                               if row["kind"] == "model_error"), None)
+        counts = state["counts"]
+        if p.max_active_seconds:
+            state.setdefault("active_elapsed_seconds", 0.0)
+        if rejection_receipt is not None:
+            trace.emit("provider_rejection_reconciled", rejection_receipt)
+        if interrupted_receipt is not None:
+            trace.emit("interrupted_model_reconciled", interrupted_receipt)
+        trace.emit("resumed" if request.resume else "started", {"fingerprint": fingerprint})
+        if request.revision_seed is not None and not request.resume:
+            trace.emit("revision_seeded", {"counts_inherited": False, "acceptance_inherited": False},
+                       visible=request.revision_seed.receipt)
+            # Recheck current requirements and archived source integrity before
+            # asking the model to revise. Old validation/acceptance is not reused.
+            state["validation_issues"] = await request.validate(state["candidate"], state["history"])
+            trace.emit("revision_seed_validation", {"acceptance_inherited": False,
+                "valid": not state["validation_issues"]}, visible=state["validation_issues"])
+        if request.external_review:
+            if not request.resume:
+                raise ValueError("external review requires an existing invocation")
+            state.update(review_revision(state, request.external_review, p))
+            trace.emit("external_review", {"reviewer": request.external_review.reviewer,
+                                           "candidate_digest": request.external_review.candidate_digest,
+                                           "budgets_reset": False}, visible=list(request.external_review.issues))
+        trace.snapshot(state)
+        cfg = replace(request.config, json_mode=not native)
+
+        def on_attempt(kind: str, data: dict[str, Any]) -> None:
+            trace.record_attempt(state, kind, data)
+
+        def usage(payload: Any) -> None:
+            if not isinstance(payload, dict):
+                state["usage_complete"] = False
+                return
+            for key in state["usage"]:
+                value = payload.get(key)
+                if isinstance(value, int) and value >= 0:
+                    state["usage"][key] += value
+                else:
+                    state["usage_complete"] = False
+
+        cfg.attempt_observer = on_attempt
+        if request.review_config is not None:
+            request.review_config.attempt_observer = on_attempt
+        active_plan: ReviewPlan | None = None
+
+        def phase_config() -> LLMConfig:
+            selected_config = request.review_config if state["next_phase"] == "reflect" and request.review_config else cfg
+            configured = phase_llm_config(selected_config, p, phase=state["next_phase"], native=native,
+                                    wire_tools=wire_tools, effort_overrides=state["phase_efforts"],
+                                    review_format_repair=bool(request.review_plan_factory is None and p.reflection_format_repair_enabled
+                                        and state["next_phase"] == "reflect" and state["protocol_output"]
+                                        and state["review_format_repair_pending"]))
+            # One actual attempt per review unit. Provider SDK retries are also
+            # disabled by the provider adapter; author behavior is unchanged.
+            if request.review_plan_factory is not None and state["next_phase"] == "reflect":
+                configured = review_unit_config(configured)
+            return configured
+
+        def recover_completion(reason: object, *, error: Exception | None = None,
+                               response: dict[str, Any] | None = None) -> bool:
+            if request.review_plan_factory is not None and state["next_phase"] == "reflect":
+                return False  # An attempted unit cannot receive a second draw.
+            plan = apply_author_empty_completion_recovery(error, response=response, state=state, policy=p,
+                                                          effort=phase_config().reasoning_effort)
+            if plan is None:
+                plan = truncation_recovery(reason, repairs=counts["protocol_repairs"],
+                                           limit=p.max_protocol_repairs, effort=phase_config().reasoning_effort)
+            if plan is None:
+                return False
+            phase = state["next_phase"]
+            empty_recovery = plan.get("recovery_kind") == "author_empty_completed_response"
+            if not empty_recovery:
+                counts["protocol_repairs"] += 1
+                state["phase_efforts"][phase] = plan["reasoning_effort"]
+            final_description = ("mars_submit_document call matching its exact argument schema"
+                                 if request.final_schema is not None else "Markdown document beginning with YAML frontmatter, without preamble or code fences")
+            if not empty_recovery:
+                state["feedback"] = (plan["feedback"].replace("JSON response", final_description)
+                                     if native and state["next_phase"] != "reflect" else plan["feedback"])
+            state["pending"] = None
+            state["status"] = "running"
+            state["last_model_error"] = None
+            trace.emit("completion_recovery", {"phase": phase, "code": plan.get("code", "output_truncated"),
+                                               "previous_effort": plan["previous_effort"],
+                                               "reasoning_effort": plan["reasoning_effort"],
+                                               "remaining_model_calls": p.remaining_model_calls(counts["model_requests"]),
+                                               **({"recovery_kind": plan["recovery_kind"],
+                                                   "response_event_seq": plan["response_event_seq"],
+                                                   "response_metadata_sha256": plan["response_metadata_sha256"],
+                                                   "protocol_repairs": counts["protocol_repairs"]} if empty_recovery else {})})
+            trace.snapshot(state)
+            return True
+
+        def stop_at_boundary(stage: Literal["before_model", "after_validation"]) -> bool:
+            decision = evaluate_stop(request.stop_condition, state, stage=stage)
+            if decision is None:
+                return False
+            state["termination"] = {"status": decision.status, "reason": decision.reason,
+                                    "details": decision.details, "stage": stage,
+                                    "contract_id": request.stop_contract_id}
+            state["status"] = decision.status
+            state["feedback"] = decision.reason
+            state["reflection_accepted"] = False
+            trace.emit("stopped", state["termination"])
+            trace.snapshot(state)
+            return True
+
+        try:
+            if request.resume:
+                recover_completion(state.get("last_model_error"))
+            while p.allows_model_calls(counts["model_requests"]):
+                trace.snapshot(state)
+                if p.max_active_seconds and state["active_elapsed_seconds"] >= p.max_active_seconds:
+                    state["status"] = "budget_exhausted"
+                    state["feedback"] = "Agent active-time budget exhausted; progress preserved for review."
+                    state["reflection_accepted"] = False
+                    trace.emit("stopped", {"status": state["status"], "reason": state["feedback"],
+                        "active_elapsed_seconds": state["active_elapsed_seconds"], "budgets_reset": False})
+                    trace.snapshot(state)
+                    break
+                if stop_at_boundary("before_model"):
+                    break
+                reviewing = state["next_phase"] == "reflect"
+                planned_review = reviewing and request.review_plan_factory is not None
+                unit: ReviewUnit | None = None
+                if planned_review:
+                    assert request.review_plan_factory is not None and request.review_plan_contract_id is not None
+                    if active_plan is None or active_plan.candidate_sha256 != digest(state["candidate"]):
+                        # Domain callbacks get a copy of history, no provider or
+                        # dispatcher. Only the loop can make or account for calls.
+                        active_plan = request.review_plan_factory(state["candidate"], json.loads(canonical(state["history"])))
+                    prior_plan_sha = state.get("review_plan", {}).get("plan_sha256")
+                    ready = prepare_review_plan(state, active_plan, contract_id=request.review_plan_contract_id,
+                                                max_model_calls=p.max_model_calls)
+                    if state["review_plan"]["plan_sha256"] != prior_plan_sha:
+                        trace.emit("review_plan_started", {"candidate_sha256": active_plan.candidate_sha256,
+                                   "plan_sha256": state["review_plan"]["plan_sha256"]}, visible=state["review_plan"])
+                    if not ready:
+                        trace.emit("review_budget_exhausted", {"reason": state["feedback"], "budgets_reset": False})
+                        trace.snapshot(state)
+                        break
+                    index = state["review_plan"]["next_unit"]
+                    unit = active_plan.units[index] if index < len(active_plan.units) else None
+                format_repair = bool(not planned_review and p.reflection_format_repair_enabled and reviewing
+                                     and state["protocol_output"] and state["review_format_repair_pending"])
+                if counts["model_requests"] == 0:
+                    await progress("started")
+                extra: list[Message] = [budget_message(p, counts)]
+                planned_correction = state.get('planned_review_format_correction') if planned_review else None
+                if planned_correction is not None:
+                    extra.append(format_correction_message(planned_correction))
+                if p.document_revisions_enabled and state["candidate"] and not reviewing:
+                    extra.append(Message("user", "[host current candidate receipt]\n" + canonical({
+                        "base_sha256": digest(state["candidate"]),
+                        "revision_tool": "mars_revise_document",
+                        "instruction": "Prefer explicit field edits for corrections; preserve unaffected definitions. "
+                        "The host validates and reviews the complete resulting candidate, never just the patch."})))
+                if state["protocol_output"]:
+                    extra.append(invalid_output_context(state["protocol_output"],
+                                 native=native and not (reviewing and p.reflection_format_repair_enabled)))
+                if reviewing and unit is None:
+                    extra.append(reflection_instruction(request.reflection_rubric, format_repair=format_repair))
+                feedback = state["feedback"]
+                if not reviewing and not p.allows_tool_calls(counts["tool_dispatches"]):
+                    feedback += "\nTool budget exhausted. Return a final grounded document or explicit evidence gaps."
+                # Reflection sends no tools; reserve only schemas actually sent.
+                phase_schema_budget = 0 if reviewing else tool_schema_budget
+                effective_budget = p.input_token_budget
+                if modern_context:
+                    from app.harness.context.runtime_policy import input_budget
+                    phase_cfg = phase_config()
+                    effective_budget = input_budget(runtime_policy, p.input_token_budget,
+                        output_reserve=phase_cfg.max_tokens, model_window=phase_cfg.extra.get("context_window"))
+                if unit is not None:
+                    try:
+                        messages, manifest = pack_review_unit(unit, budget=effective_budget,
+                            budget_context=budget_message(p, counts), format_correction=planned_correction)
+                    except ValueError as exc:
+                        state["status"] = "review_evidence_unavailable"
+                        state["feedback"] = str(exc)
+                        trace.emit("review_evidence_unavailable", {"reason": str(exc), "unit_id": unit.unit_id})
+                        trace.snapshot(state)
+                        break
+                elif modern_context:
+                    from app.harness.context.runtime_native import pack_native
+                    phase_tools = () if reviewing else wire_tools
+                    messages, manifest = pack_native(
+                        pinned=(request.review_messages if reviewing and request.review_messages is not None else pinned) + extra,
+                        history=state["history"], feedback=feedback, candidate=state["candidate"],
+                        budget=effective_budget, tools=phase_tools, policy=runtime_policy,
+                        metadata=request.context_metadata, root=(Path(str(request.tool_context.extra.get("run_root") or request.trace_root.parent)) if p.trace == "full" else None),
+                        previous=state.get("context_compaction", {}).get(state["next_phase"]),
+                        agent=request.tool_context.agent, readback_available="context.read_material" in request.tools and not reviewing,
+                        native=native, reviewing=reviewing, review_issues=state["review_issues"],
+                        validation_issues=state["validation_issues"], required_review_tools=request.required_review_tools,
+                        native_observation_history=p.native_observation_history, deduplicate_evidence=p.deduplicate_evidence_enabled)
+                    state.setdefault("context_compaction", {})[state["next_phase"]] = manifest["state"]
+                else:
+                    messages, manifest = pack_context(
+                        (request.review_messages if reviewing and request.review_messages is not None else pinned) + extra,
+                        state["history"], feedback, state["candidate"],
+                        budget=p.input_token_budget - phase_schema_budget, observation_chars=p.observation_chars,
+                        native=native, reviewing=reviewing, review_issues=state["review_issues"],
+                        validation_issues=state["validation_issues"],
+                        required_review_tools=request.required_review_tools,
+                        native_observation_history=p.native_observation_history,
+                        deduplicate_evidence=p.deduplicate_evidence_enabled,
+                    )
+                if modern_context and unit is not None:
+                    from app.harness.context.runtime_pack import pack_messages
+                    messages, modern_manifest = pack_messages(messages, policy=runtime_policy,
+                        budget=effective_budget,
+                        root=None, agent=request.tool_context.agent, readback_available=False)
+                    manifest.update(modern_manifest)
+                    manifest["estimated_upper_bound_tokens"] = modern_manifest["used"]
+                manifest["tool_schema_upper_bound_tokens"] = phase_schema_budget
+                manifest["total_input_upper_bound_tokens"] = manifest["estimated_upper_bound_tokens"] + phase_schema_budget
+                if reviewing and unit is None:
+                    missing = missing_review_evidence(state["history"], manifest, request.required_review_tools,
+                                                      observation_chars=p.observation_chars)
+                    if missing:
+                        state["status"] = "review_evidence_unavailable"
+                        state["feedback"] = "Required review evidence was compressed or omitted: " + "; ".join(missing)
+                        trace.emit("review_evidence_unavailable", {"missing": missing, "context_manifest": manifest})
+                        trace.snapshot(state)
+                        break
+                counts["model_requests"] += 1
+                state["pending"] = "model"
+                call_config = phase_config()
+                review_request = start_review_unit(state, messages) if planned_review else None
+                runtime_manifest_path = None
+                if modern_context and manifest.get("version") == 3 and p.trace == "full":
+                    from app.harness.context.runtime_manifest import record_manifest
+                    runtime_manifest_path = record_manifest(
+                        Path(str(request.tool_context.extra.get("run_root") or request.trace_root.parent)),
+                        agent=request.tool_context.agent, node=correlation["node_id"], project=request.tool_context.project,
+                        messages=messages, tools=call_config.tools, manifest=manifest)
+                    if manifest["triggered"]:
+                        trace.emit("context_compressed", {"before": manifest["before"], "after": manifest["used"],
+                            "target_reached": manifest["target_reached"], "decisions": manifest["decisions"]})
+                trace.emit("context_packed", manifest)
+                trace.emit("model_request", {"request": counts["model_requests"], "phase": state["next_phase"],
+                                             "provider": call_config.provider, "model": call_config.model,
+                                             "reasoning_effort": call_config.reasoning_effort,
+                                             "thinking_enabled": call_config.thinking_enabled,
+                                             "repair_mode": ("planned_review_format" if planned_correction is not None
+                                                             else "review_format" if format_repair else None),
+                                             "max_tokens": call_config.max_tokens,
+                                             **({"review_unit_id": review_request["unit_id"],
+                                                 "review_plan_sha256": review_request["plan_sha256"],
+                                                 "review_candidate_sha256": review_request["candidate_sha256"],
+                                                 "max_retries": call_config.max_retries} if review_request else {})},
+                           visible=[m.to_wire() for m in messages])
+                trace.snapshot(state)
+                try:
+                    completion = await asyncio.wait_for(
+                        guarded_complete(
+                            request.review_provider if reviewing and request.review_provider else request.provider,
+                            messages, call_config,
+                            run_root=Path(str(request.tool_context.extra.get("run_root") or request.trace_root.parent)),
+                            active_model_time=True,
+                            correlation=correlation),
+                        timeout=llm_call_deadline_seconds(call_config))
+                except ResourceBudgetError as exc:
+                    state["status"] = "budget_exhausted"
+                    state["pending"] = None
+                    state["resource_error"] = str(exc)
+                    trace.emit("resource_budget_exhausted", {"reason": str(exc), "request_sent": False})
+                    break
+                except Exception as exc:
+                    usage(getattr(exc, "usage", None))
+                    rejected_response: dict[str, Any] | None = None
+                    if isinstance(exc, LLMCompletionError):
+                        counts["model_responses"] += 1
+                        response_payload = {"request": counts["model_requests"], "rejected": True,
+                                            "reason": exc.reason, "usage": exc.usage,
+                                            "requested_model": call_config.model,
+                                            **exc.model_identity}
+                        trace.emit("model_response", response_payload)
+                        rejected_response = {"event_seq": trace.seq, "kind": "model_response", **response_payload}
+                        state["pending"] = None
+                    state["status"] = "model_error"
+                    state["last_model_error"] = getattr(exc, "reason", None)
+                    trace.emit("model_error", {"error_type": type(exc).__name__, "reason": getattr(exc, "reason", None),
+                        "frames": [{"file": Path(frame.filename).name, "function": frame.name, "line": frame.lineno}
+                                   for frame in traceback.extract_tb(exc.__traceback__)[-6:]]})
+                    if recover_completion(state["last_model_error"], error=exc, response=rejected_response):
+                        continue
+                    break
+                if completion.is_mock or completion.provider in {"mock", "fake"}:
+                    raise RuntimeError("non-real completion rejected")
+                counts["model_responses"] += 1
+                if runtime_manifest_path is not None:
+                    from app.harness.context.runtime_manifest import record_usage
+                    record_usage(runtime_manifest_path, completion.raw.get("usage"))
+                usage(completion.raw.get("usage"))
+                state["pending"] = None
+                state["last_model_error"] = None
+                response_visible = ({"text": completion.text, "tool_calls": [c.to_wire() for c in completion.tool_calls]}
+                                    if native else completion.text)
+                trace.emit("model_response", {"request": counts["model_requests"], "provider": completion.provider,
+                                              "model": completion.model, "requested_model": call_config.model,
+                                              "response_models": completion.raw.get("response_models", []),
+                                              "response_model_status": completion.raw.get("response_model_status", "unreported"),
+                                              "response_model_missing_fields": completion.raw.get("response_model_missing_fields"),
+                                              "response_model_invalid_fields": completion.raw.get("response_model_invalid_fields"),
+                                              "usage": completion.raw.get("usage")},
+                           visible=response_visible)
+                review_conflict = False
+                unit_result: UnitReviewResult | None = None
+                parse_error: ValueError | None = None
+                try:
+                    if planned_review and completion.tool_calls:
+                        raise ValueError("review units cannot return tool calls")
+                    if unit is not None:
+                        unit_result = unit.parse_response(completion.text)
+                        decision = parse_review(canonical(unit_result.decision))
+                    else:
+                        decision = (parse_review(completion.text) if reviewing else
+                                    native_decision(completion, request.tools, structured_final=request.final_schema is not None,
+                                                    allow_revisions=p.document_revisions_enabled, candidate=state["candidate"],
+                                                    body_field=p.submission_body_field)
+                                    if native else parse_action(completion.text))
+                except ReviewConflictError as exc:
+                    # Keep the original response in trace, but never fix this by
+                    # asking the reviewer to erase its issue list without revision.
+                    if planned_review and active_plan is not None and active_plan.failure_mode == "collect_units":
+                        parse_error = exc
+                    else:
+                        review_conflict = True
+                        decision = {**exc.review, "accept": False}
+                        trace.emit("review_conflict", {"effective_accept": False}, visible=exc.review)
+                except ValueError as exc:
+                    parse_error = exc
+                if parse_error is not None:
+                    counts["protocol_repairs"] += 1
+                    if planned_review:
+                        # A known formatting failure gets at most one explicit,
+                        # charged correction. It never replays tools, an unknown
+                        # provider request, or a substantive scientific rejection.
+                        correction = (queue_review_format_correction(state, error=str(parse_error),
+                            response_text=completion.text, response_visible=response_visible)
+                            if is_review_format_error(parse_error) and p.allows_model_calls(counts['model_requests'])
+                            and counts['protocol_repairs'] <= p.max_protocol_repairs else None)
+                        if correction is not None:
+                            trace.emit('review_unit_format_error', {'request': correction['request'],
+                                'unit_id': correction['unit_id'], 'automatic_format_correction': True,
+                                'tools_replayed': False, 'candidate_changed': False}, visible=correction)
+                            trace.snapshot(state)
+                            continue
+                        failure = UnitReviewResult({"accept": False, "issues": ["Review response failed its contract: " + str(parse_error)],
+                                                    "rationale": "No usable review decision; the candidate is not accepted."},
+                                                   {"protocol_error": str(parse_error)})
+                        record = finish_review_unit(state, failure, response_text=completion.text,
+                                                    response_visible=response_visible, valid=False)
+                        trace.emit("review_unit", {"request": counts["model_requests"], "unit_id": record["unit_id"],
+                                                   "valid": False}, visible=record)
+                        state["status"] = "review_protocol_error"
+                        state["reflection_accepted"] = False
+                        state["feedback"] = failure.decision["issues"][0]
+                        trace.emit("protocol_error", {"error": str(parse_error), "review_unit_id": record["unit_id"],
+                                                      "automatic_retry": False})
+                        trace.snapshot(state)
+                        break
+                    state["review_format_repair_pending"] = bool(
+                        p.reflection_format_repair_enabled and reviewing and is_review_format_error(parse_error))
+                    state["protocol_output"] = (canonical({"text": completion.text, "tool_calls": [c.to_wire() for c in completion.tool_calls]})
+                                                if native else completion.text)
+                    state["feedback"] = action_protocol_feedback(str(parse_error))
+                    if reviewing:
+                        state["feedback"] = (
+                            f"Review protocol error: {parse_error}. Return exactly one JSON object with "
+                            "accept (boolean), issues (array of unresolved blocker strings), and rationale (string). "
+                            "Do not return a proposal, tool invocation, XML, code fence or multiple JSON objects. "
+                            "Review the current candidate and preserve substantive findings while fixing only format."
+                        )
+                        if state["review_format_repair_pending"]:
+                            state["feedback"] = (
+                                f"Review JSON format error: {parse_error}. Correct only syntax or duplicate keys in the complete "
+                                "provided review. Preserve every substantive finding and unresolved blocker. "
+                                "Do not reassess the candidate or discard an issue to produce acceptance."
+                            )
+                    elif native:
+                        final_instruction = ("call mars_submit_document with complete metadata and body"
+                                             if request.final_schema is not None else "submit the complete Markdown candidate")
+                        state["feedback"] = (f"Protocol error: {parse_error}. Use valid native research tool calls or {final_instruction}. "
+                                             "For document submission, arguments must be exactly one JSON object with "
+                                             "two keys: metadata and body. Close metadata before body; close the root "
+                                             "once after body. Do not append another body or object after the root. "
+                                             "Resolve the pinned candidate validation errors too. No rejected action was executed.")
+                        if p.document_revisions_enabled and state["candidate"]:
+                            state["feedback"] += " You may instead use mars_revise_document with the current base_sha256 and explicit operations."
+                        if p.submission_body_field:
+                            state["feedback"] = (f"Protocol error: {parse_error}. No rejected action was executed. "
+                                "Call mars_submit_document with one JSON object containing metadata fields DIRECTLY. "
+                                "Do not use metadata/body wrapper keys or append a second object. "
+                                f"The host copies your {p.submission_body_field} as body. "
+                                "Use existing observations and resolve pinned errors. "
+                                + ("For local edits use mars_revise_document with the current base_sha256." if state["candidate"] else ""))
+                        if state["candidate"] and p.document_revisions_enabled:
+                            from app.harness.agent_loop.document_revision import revision_feedback
+                            state["feedback"] += "\n" + revision_feedback(str(parse_error))
+                    trace.emit("protocol_error", {"error": str(parse_error),
+                               "repair_mode": "review_format" if state["review_format_repair_pending"] else None})
+                    if counts["protocol_repairs"] > p.max_protocol_repairs:
+                        state["status"] = "protocol_exhausted"
+                        break
+                    trace.snapshot(state)
+                    continue
+                state["protocol_output"] = ""
+                if reviewing:
+                    finished_record: dict[str, Any] | None = None
+                    if planned_review:
+                        details = unit_result.details if unit_result is not None else {"review": decision}
+                        finished_record, outcome = apply_planned_review_decision(state, UnitReviewResult(decision, details),
+                            response_text=completion.text, response_visible=response_visible, max_reflections=p.max_reflections)
+                        trace.emit("review_unit", {"request": counts["model_requests"], "unit_id": finished_record["unit_id"],
+                                                   "valid": True}, visible=finished_record)
+                        if outcome == "next_unit":
+                            # Collected unit decisions, positive or negative, are
+                            # never exposed to the next isolated reviewer.
+                            trace.snapshot(state)
+                            await progress("review_unit", unit_id=finished_record["unit_id"],
+                                           accepted=finished_record["decision"]["accept"])
+                            continue
+                        aggregate = completed_plan_decision(state["review_plan"])
+                        assert aggregate is not None
+                        decision = aggregate
+                    else:
+                        outcome = apply_review_decision(state, decision, format_repair=format_repair,
+                                                        max_reflections=p.max_reflections)
+                    if outcome == "independent_review":
+                        trace.emit("review_format_repaired", {"accept": True, "effective_accept": False,
+                                   "repair_mode": "review_format", "independent_review_required": True}, visible=decision)
+                        await progress("review_format_repaired", independent_review_required=True)
+                        trace.snapshot(state)
+                        continue
+                    trace.emit("reflection", {"accept": decision["accept"], "round": counts["reflections"],
+                                              "host_conflict_rejection": review_conflict,
+                                              **({"review_plan_sha256": state["review_plan"]["plan_sha256"],
+                                                  "review_candidate_sha256": state["review_plan"]["candidate_sha256"]}
+                                                 if planned_review and active_plan is not None
+                                                 and active_plan.failure_mode == "collect_units" else {}),
+                                              "repair_mode": "review_format" if format_repair else None}, visible=decision)
+                    trace.snapshot(state)
+                    if finished_record is not None:
+                        await progress("review_unit", unit_id=finished_record["unit_id"],
+                                       accepted=finished_record["decision"]["accept"])
+                    await progress("review", accepted=decision["accept"], issues=decision["issues"], rationale=decision["rationale"])
+                    if outcome == "accepted":
+                        break
+                    if counts["reflections"] >= p.max_reflections:
+                        break
+                elif "final" in decision:
+                    original_candidate = decision['final']
+                    state["candidate"] = normalize_document_output(original_candidate)
+                    if state['candidate'] != original_candidate:
+                        trace.emit('document_transport_normalized', {
+                            'original_sha256': digest(original_candidate), 'candidate_sha256': digest(state['candidate']),
+                            'content_invented': False, 'validation_required': True,
+                            'body_rewritten': False})
+                    if decision.get("format_compatibility"):
+                        trace.emit("document_format_normalized", {"call_id": decision["submission_id"],
+                            "candidate_sha256": digest(state["candidate"]), "content_invented": False,
+                            "validation_required": True}, visible=decision["format_compatibility"])
+                    if "revision" in decision:
+                        trace.emit("document_revision", {"call_id": decision["submission_id"],
+                            "base_sha256": decision["revision"]["base_sha256"],
+                            "candidate_sha256": digest(state["candidate"]),
+                            "operation_count": len(decision["revision"]["operations"]), "atomic": True},
+                            visible=decision["revision"])
+                    if "submission_id" in decision:
+                        trace.emit("document_submission", {"call_id": decision["submission_id"],
+                                                           "candidate_sha256": digest(state["candidate"]),
+                                                           "serialization_only": True})
+                    await progress("candidate", text=state["candidate"])
+                    errors = await request.validate(state["candidate"], state["history"])
+                    if state.get("revision_seed", {}).get("candidate_sha256") == digest(state["candidate"]):
+                        errors.append("/candidate: human-requested revision cannot resubmit the unchanged rejected draft")
+                    if state["review_issues"] and digest(state["candidate"]) == state["reviewed_candidate_sha"]:
+                        errors.append("/candidate: unresolved review issues require a revised candidate")
+                    state["validation_issues"] = list(errors)
+                    trace.emit("validation", {"valid": not errors}, visible=errors)
+                    await progress("validation", valid=not errors, issues=errors)
+                    if errors:
+                        counts["validation_repairs"] += 1
+                        state["feedback"] = canonical({"validation_errors": errors})
+                        if not p.completion_driven and counts["validation_repairs"] > p.max_validation_repairs:
+                            state["status"] = "validation_exhausted"
+                            break
+                    elif stop_at_boundary("after_validation"):
+                        break
+                    elif p.mode == "reflection":
+                        state["next_phase"] = "reflect"
+                        state["feedback"] = ""
+                    else:
+                        state["status"] = "passed"
+                        break
+                else:
+                    actions = decision.get("batch", [decision])
+                    identities = [digest({"tool": a["tool"], "args": a["args"]}) for a in actions]
+                    if len(actions) > 1:
+                        if (not p.allows_tool_calls(counts["tool_dispatches"], len(actions)) or
+                            len(identities) != len(set(identities)) or
+                            any(i in state["seen"] and not state["seen"][i]["retry_allowed"]
+                                and action["tool"] not in fresh_reads for i, action in zip(identities, actions))):
+                            state["feedback"] = rejected_batch_feedback(actions, seen=state["seen"],
+                                history=state["history"], policy=p, used=counts["tool_dispatches"])
+                            trace.snapshot(state)
+                            continue
+                        for action in actions:
+                            action.update(native_batch_id=counts["model_requests"], native_batch_size=len(actions))
+                        state["pending_batch"] = True
+                    for decision in actions:
+                        counts["action_rounds"] += 1
+                        tool = decision["tool"]
+                        identity = digest({"tool": tool, "args": decision["args"]})
+                        if tool not in request.tools:
+                            state["feedback"] = f"Tool {tool} is not available for this agent."
+                        elif not p.allows_tool_calls(counts["tool_dispatches"]):
+                            state["feedback"] = "Tool budget exhausted."
+                        elif (identity in state["seen"] and not state["seen"][identity]["retry_allowed"]
+                              and tool not in fresh_reads):
+                            state["feedback"] = rejected_batch_feedback([decision], seen=state["seen"],
+                                history=state["history"], policy=p, used=counts["tool_dispatches"])
+                        else:
+                            prior = state["seen"].get(identity)
+                            state["pending"] = "tool"
+                            counts["tool_dispatches"] += 1
+                            trace.emit("tool_dispatch", {"step": counts["tool_dispatches"], "tool": tool}, visible=decision)
+                            trace.snapshot(state)
+                            await progress("action", tool=tool, reason=decision.get("reason", ""), args=decision["args"])
+                            result = await request.registry.dispatch(tool, decision["args"], request.tool_context)
+                            observation = {**decision, "ok": result.ok, "output": result.output, "error": result.error,
+                                           "status": result.status, "blocked_by_gate": result.blocked_by_gate}
+                            if p.trace == "full":
+                                raw = request.trace_root / "tools" / f"{counts['tool_dispatches']:04d}.json"
+                                atomic_json(raw, observation)
+                                observation["raw_ref"] = str(raw)
+                            state["history"].append(observation)
+                            counts["observations"] += 1
+                            state["pending"] = None
+                            retryable = (not result.ok and not result.blocked_by_gate and not result.requires_approval
+                                         and any(word in (result.error or "").lower() for word in
+                                                 ("timeout", "timed out", "429", "502", "503", "504", "connection")))
+                            state["seen"][identity] = {"retry_allowed": retryable and prior is None}
+                            state["feedback"] = ""
+                            trace.emit("observation", {"step": counts["tool_dispatches"], "tool": tool, "ok": result.ok},
+                                       visible=observation)
+                            await progress("observation", tool=tool, ok=result.ok, error=result.error)
+                            if result.requires_approval or result.blocked_by_gate:
+                                state["status"] = "blocked"
+                                break
+                    if state["status"] == "blocked":
+                        break
+                    state["pending_batch"] = False
+                trace.snapshot(state)
+            if state["status"] == "running":
+                stop_at_boundary("before_model")
+            if state["status"] == "running":
+                state["status"] = "budget_exhausted"
+        except asyncio.CancelledError:
+            if apply_loop_cancellation(state):
+                trace.emit("interrupted", {"pending": state["pending"]})
+                raise
+            trace.emit("cancelled_after_completion", {"status": state["status"]})
+        except Exception as exc:
+            state["status"] = "error"
+            trace.emit("error", {"error_type": type(exc).__name__, "message": str(exc)[:500]})
+            raise
+        finally:
+            trace.emit("finished", {"status": state["status"]})
+            trace.snapshot(state)
+            await request.provider.close()
+            if request.review_provider is not None and request.review_provider is not request.provider:
+                await request.review_provider.close()
+            if request.review_config is not None:
+                request.review_config.attempt_observer = None
+            cfg.attempt_observer = None
+            await progress("finished", status=state["status"], reason=state.get("termination", {}).get("reason", ""))
+        return LoopResult(state["candidate"], state["status"], state["history"], dict(counts),
+                          request.trace_root, state["reflection_accepted"], state.get("resource_error", ""))

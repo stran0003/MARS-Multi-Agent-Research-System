@@ -1,0 +1,2472 @@
+"""Orchestrator: api -> bridge entrypoint.
+
+Receives a high-level RunRequest, builds a RunGraph via workflow_service,
+walks it node-by-node, and pushes events through the event_bus. Agent
+implementations are looked up via agent_registry (reverse dependency).
+"""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+from collections.abc import Awaitable, Callable
+from copy import deepcopy
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Literal, cast
+from uuid import uuid4
+
+from loguru import logger
+
+from app.bridge.agent_registry import AgentRegistry, get_registry
+from app.bridge.bridge_agent import BridgeAgent, BridgeDecision
+from app.bridge.commander_agent import CommanderAgent, FeedbackDecision
+from app.bridge.langgraph_runtime import LangGraphRuntimeFacade
+from app.bridge.node_key import attempt_key, parse_node_key
+from app.bridge.owned_run_tasks import OwnedRunTasks
+from app.bridge.research_contract_service import FrozenResearchTask, validate_frozen_research_task
+from app.bridge.research_run_service import (
+    CONTRACT_HASH_KEY, check_research_run_storage_paths, persist_run_research_contract, research_execution_admission,
+)
+from app.bridge.workflow_service import (
+    LINEAR_STAGES,
+    EntryPoint,
+    build_pipeline,
+    build_standalone,
+    ready_batch,
+    scheduler_parallelism,
+)
+from app.harness.observability.tracing import TraceRecorder
+from app.harness.runtime.event_bus import EventBus, InProcessEventBus
+from app.harness.runtime.readiness import assert_ready_for_run
+from app.harness.runtime.run_graph import RunGraph
+from app.harness.runtime.state_machine import NodeState
+from app.settings import get_settings
+from app.storage.run_store import RunHandle, RunStore
+from app.storage.run_state_store import RunStateSnapshot, RunStateStore
+
+
+# Node runners execute registered agents; missing registration fails explicitly.
+NodeRunner = Callable[[RunHandle, str], Awaitable[None]]
+
+_ORCHESTRATED_ENTRYPOINTS = frozenset(("pipeline", *LINEAR_STAGES))
+_EXTERNAL_LIFECYCLE_STATES: dict[str, NodeState] = {
+    "created": NodeState.PENDING,
+    "pending": NodeState.PENDING,
+    "running": NodeState.RUNNING,
+    "paused": NodeState.WAITING_REVIEW,
+    "waiting_hitl": NodeState.WAITING_REVIEW,
+    "completed": NodeState.DONE,
+    "stopped": NodeState.DONE,
+    "failed": NodeState.FAILED,
+    "cancelled": NodeState.FAILED,
+}
+
+
+@dataclass
+class RunRequest:
+    task: str
+    project: str
+    entrypoint: EntryPoint = "pipeline"
+    standalone: bool = False
+    user_request: str = ""
+    auto_approve: bool = False  # Phase 4: when False, wait for HITL approve
+    review_mode: Literal["manual", "commander"] = "manual"
+    review_generation: int = 0
+    data_source: dict[str, Any] | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class RunSession:
+    run: RunHandle
+    graph: RunGraph
+    request: RunRequest
+    bus: EventBus
+    runners: dict[str, NodeRunner] = field(default_factory=dict)
+    waiting_for_feedback: bool = False
+    read_only: bool = False
+    read_only_reason: str | None = None
+    termination: dict[str, Any] | None = None
+    state_revision: int = 0
+    state_event_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    stop_state_error: dict[str, str] | None = None
+
+
+class Orchestrator:
+    def __init__(
+        self,
+        *,
+        run_store: RunStore | None = None,
+        registry: AgentRegistry | None = None,
+        bus: EventBus | None = None,
+    ) -> None:
+        self.run_store = run_store or RunStore()
+        self.registry = registry or get_registry()
+        self.bus = bus or InProcessEventBus()
+        self.bridge_agent = BridgeAgent()
+        self.commander_agent = CommanderAgent()
+        self.langgraph_runtime = LangGraphRuntimeFacade()
+        self._sessions: dict[str, RunSession] = {}
+        self.owned_tasks = OwnedRunTasks()
+        from app.bridge.execution_preparation import ExecutionPreparations
+        self.execution_preparations = ExecutionPreparations()
+        from app.bridge.research_run_stop import ResearchRunStops
+        self.research_stops = ResearchRunStops()
+        self.max_parallel_nodes = scheduler_parallelism()
+        self._resume_invocations: dict[tuple[str, str], str] = {}
+
+    # --------------------------------------------------------------- create
+
+    def set_review_mode(self, run_id: str, *, project: str, enabled: bool) -> None:
+        """Changing reviewers never starts or retries a failed research stage."""
+        session = self.session(run_id)
+        if session.run.project != project or session.read_only:
+            raise ValueError("任务不属于当前项目，或当前任务不可修改。")
+        mode: Literal["manual", "commander"] = "commander" if enabled else "manual"
+        unchanged = session.request.review_mode == mode and not session.request.auto_approve
+        if unchanged and (self.owned_tasks.active(run_id) is not None or NodeState.WAITING_REVIEW not in session.graph.all_states().values()):
+            return
+        if not unchanged:
+            snapshot = RunStateStore(session.run).load()
+            session.request.review_mode = mode
+            session.request.review_generation += 1
+            session.request.auto_approve = False
+            self._persist_state(session, status=snapshot.status if snapshot else "created")
+            session.run.write_event("agent_events", {"event": "commander.review_mode_changed", "agent": "commander", "actor": "user",
+                "review_mode": mode, "generation": session.request.review_generation, "timestamp": datetime.now(timezone.utc).isoformat()})
+        if self.owned_tasks.active(run_id) is None:
+            waiting = [node for node, state in session.graph.all_states().items() if state == NodeState.WAITING_REVIEW]
+            if len(waiting) == 1 and not any(state in {NodeState.RUNNING, NodeState.FAILED} for state in session.graph.all_states().values()):
+                node = waiting[0]
+                if session.termination is not None:
+                    self._release_review_stop(session, agent=parse_node_key(node).stage, operation="review_wait")
+                async def attach_review() -> None:
+                    from app.harness.llm.accounting import run_resource_scope
+                    with run_resource_scope(session.run.root):
+                        await self._await_hitl_or_auto(session, node)
+                        if not self._stopping(session):
+                            await self._complete_approved_node(session, node)
+                            await self._run(run_id)
+                self._spawn_owned(session, "managed_review", attach_review)
+            elif enabled and session.waiting_for_feedback and not self._stopping(session) and session.request.extra.get("stop_after") != "execution":
+                completed = [node for node, state in session.graph.all_states().items()
+                             if parse_node_key(node).stage == "execution" and state == NodeState.DONE]
+                if completed:
+                    latest = max(completed, key=lambda key: parse_node_key(key).attempt)
+                    async def attach_feedback() -> None:
+                        from app.harness.llm.accounting import run_resource_scope
+                        with run_resource_scope(session.run.root):
+                            session.waiting_for_feedback = False
+                            await self._after_execution(session, latest)
+                            if not self._stopping(session) and not session.waiting_for_feedback:
+                                await self._run(run_id)
+                    self._spawn_owned(session, "managed_feedback_review", attach_feedback)
+
+    async def _managed_artifact_review(self, session: RunSession, node_key: str, review: Any) -> None:
+        from app.bridge.managed_review import review_once, finish_review, review_policy, revision_count, review_state
+        from app.bridge.evaluation_service import build_artifact_evaluation_summary, refresh_stale_artifact_evaluations
+        from app.bridge.coding_approval import verify_written_code
+        from app.bridge.research_branch import research_branch_scope
+        from app.hitl.approval import approve, request_revision
+        from app.harness.schema.validator import validate_document
+        from app.storage.artifact_store import SCHEMA_TO_AGENT
+        from app.harness.context.folder_context import load_folder_context
+        from app.bridge.managed_coding_evidence import coding_preparation_review_evidence
+
+        generation = session.request.review_generation
+        state = review_state(session.run) or {}
+        if state.get("host_failure") and state.get("node") == node_key and state.get("generation") == generation:
+            return
+
+        def eligible() -> bool:
+            return (session.request.review_mode == "commander" and session.request.review_generation == generation
+                    and not self._stopping(session) and not session.read_only
+                    and not any(event.is_set() for event in (review.approval_event, review.rejection_event, review.regenerate_event)))
+
+        if not eligible():
+            return
+        ref = review.artifact_ref
+        text = ref.path.read_text(encoding="utf-8")
+        schema = next(key for key, value in SCHEMA_TO_AGENT.items() if value == (ref.agent_dir, ref.stem))
+        validation = validate_document(text, expected_schema=schema)
+        refresh_stale_artifact_evaluations(session.run, ref)
+        evaluation = build_artifact_evaluation_summary(run=session.run, ref=ref, node_key=node_key)
+        blocker = ""
+        if not validation.valid or validation.metadata.get("project") != session.run.project:
+            blocker = "方案格式或项目身份校验未通过，请接管审核。"
+        elif evaluation.get("blocking") or (not evaluation.get("policy", {}).get("auto_approval_allowed") and evaluation.get("policy", {}).get("gate") != "revise"):
+            blocker = "产物检查尚未满足托管审批标准，请查看检查证据并处理阻塞。"
+        if ref.agent_dir == "coding" and not blocker:
+            try:
+                with research_branch_scope(session.run, node_key):
+                    if not verify_written_code(session.run, text):
+                        blocker = "尚无与方案对应的实际代码实现，主控未执行或批准旧补丁，请接管审核。"
+            except (OSError, ValueError, RuntimeError) as error:
+                blocker = f"真实代码核对未通过：{error}"
+        upstream = {str(path.relative_to(session.run.root)): path.read_text(encoding="utf-8")
+                    for directory in ("idea", "experiment", "coding", "execution")
+                    for path in session.run.subdir(directory).glob("*.approved.md") if directory != ref.agent_dir}
+        if session.request.extra.get('evolution'):
+            for name in ('input/evolution_contract.v1.json', 'evolution/handoff.json'):
+                path = session.run.root / name
+                if path.is_file():
+                    upstream[name] = path.read_text()
+        artifact_ref = ref.path.relative_to(session.run.root).as_posix()
+        folder_context = load_folder_context(session.run.project, session.run.root)
+        tool_log = session.run.root / "events/tool_calls.jsonl"
+        code_checks = [row for line in (tool_log.read_text().splitlines() if tool_log.exists() else [])
+                       if (row := json.loads(line)).get("agent") == "coding" and row.get("tool") == "code.run_tests"]
+        preparation_evidence: dict[str, dict[str, Any]] = {}
+        if ref.agent_dir == "coding" and not blocker:
+            try:
+                preparation_evidence = coding_preparation_review_evidence(session.run, validation.metadata)
+            except (OSError, ValueError, KeyError, TypeError):
+                blocker = "本次执行准备或真实预检证据无法核验，请重新核对；主控未批准。"
+        payload = {"goal": session.request.user_request, "task": session.request.task, "project": session.run.project,
+                   "artifact_ref": artifact_ref, "candidate": text, "approved_upstream": upstream,
+                   "project_context": folder_context, "actual_code_checks": code_checks,
+                   "execution_preparation_evidence": preparation_evidence,
+                   "evaluation": evaluation, "stop_after": session.request.extra.get("stop_after"),
+                   "evidence_refs": [artifact_ref, *upstream.keys(), "artifact_evaluation", *preparation_evidence.keys(), *(["input/folder_context.v1.json"] if folder_context else []), *(["events/tool_calls.jsonl"] if code_checks else [])]}
+        decision = await review_once(run=session.run, node=node_key, kind="artifact", payload=payload, generation=generation,
+                                     eligible=eligible, bus=session.bus, blocker=blocker)
+        if decision is None or not eligible():
+            return
+        if decision.decision == "approve" and not evaluation.get("policy", {}).get("auto_approval_allowed"):
+            from app.bridge.managed_review import ReviewDecision
+            findings = "；".join(str(item.get("message", "")) for item in evaluation.get("top_findings", []))
+            original_identity = decision._identity
+            decision = ReviewDecision(decision="revise", reason="主控模型建议批准，但产物检查仍要求修正，尚未放行：" + findings,
+                                      evidence_refs=["artifact_evaluation"])
+            decision._identity = original_identity
+        from app.storage.artifact_store import ArtifactStore
+        current_ref = ArtifactStore(session.run).latest_candidate(agent_dir=ref.agent_dir, stem=ref.stem)
+        if current_ref is None or current_ref.path != ref.path or load_folder_context(session.run.project, session.run.root) != folder_context:
+            await finish_review(session.run, session.bus, "needs_user", "审核期间当前方案版本或项目约束已变化，请重新核对。", identity=decision._identity)
+            return
+        if ref.path.read_text(encoding="utf-8") != text or any((session.run.root / path).read_text(encoding="utf-8") != value for path, value in upstream.items()):
+            await finish_review(session.run, session.bus, "needs_user", "审核期间方案或上游依据已变化，请重新核对。", identity=decision._identity)
+            return
+        if preparation_evidence:
+            try:
+                unchanged = coding_preparation_review_evidence(session.run, validation.metadata) == preparation_evidence
+            except (OSError, ValueError, KeyError, TypeError):
+                unchanged = False
+            if not unchanged:
+                await finish_review(session.run, session.bus, "needs_user", "审核期间执行准备或真实预检证据已变化，请重新核对。", identity=decision._identity)
+                return
+        if decision.decision == "approve":
+            # Repeat host checks at the write boundary. LLM judgement cannot
+            # override a changed checkout, evaluation or immutable candidate.
+            current = build_artifact_evaluation_summary(run=session.run, ref=ref, node_key=node_key)
+            if current != evaluation:
+                await finish_review(session.run, session.bus, "needs_user", "审核期间检查证据已变化，请重新核对。", identity=decision._identity)
+                return
+            if ref.agent_dir == "coding":
+                with research_branch_scope(session.run, node_key):
+                    if not verify_written_code(session.run, text):
+                        raise ValueError("实际代码差异未通过复核")
+                    await approve(session=review, bus=session.bus, actor="commander")
+            else:
+                await approve(session=review, bus=session.bus, actor="commander")
+            await finish_review(session.run, session.bus, "approved", decision.reason, identity=decision._identity)
+        elif decision.decision == "revise":
+            if revision_count(session.run, node_key) >= review_policy().max_revisions_per_node:
+                await finish_review(session.run, session.bus, "needs_user", "已达到主控返工次数上限，请接管审核。" + decision.reason, identity=decision._identity)
+                return
+            await request_revision(session=review, bus=session.bus, actor="commander", reason=decision.reason)
+            await finish_review(session.run, session.bus, "revision_requested", decision.reason, identity=decision._identity)
+        else:
+            await finish_review(session.run, session.bus, "needs_user", decision.reason, identity=decision._identity)
+
+    def create_session(self, request: RunRequest, *, research_contract: FrozenResearchTask | None = None,
+                       on_run_allocated: Callable[[RunHandle], None] | None = None) -> RunSession:
+        from app.bridge.research_context import archive_research_context
+        from app.bridge.idea_input_context import validate_idea_extra
+
+        if research_contract is not None:
+            research_contract = validate_frozen_research_task(research_contract, check_live_files=True)
+            if (request.project != research_contract.task.project.project_id
+                    or request.user_request != research_contract.task.goal or request.entrypoint != "pipeline"
+                    or request.standalone or request.auto_approve or request.data_source is not None or request.extra):
+                raise ValueError("Research contract cannot be combined with independent run overrides")
+            request.extra = {CONTRACT_HASH_KEY: research_contract.task_sha256}
+        elif CONTRACT_HASH_KEY in request.extra:
+            raise ValueError("Research contract identity requires the complete frozen contract")
+        if request.extra.get('evolution') is not None:
+            from app.harness.evolution import EvolutionContract, bind_explicit_metric_deltas
+            evolution = bind_explicit_metric_deltas(EvolutionContract.model_validate(request.extra['evolution']),
+                                                   [request.user_request])
+            if request.entrypoint not in {'pipeline', 'idea'} or request.standalone:
+                raise ValueError('Auto Research starts with Idea and continues through the complete pipeline')
+            request.extra = {**request.extra, 'evolution': evolution.model_dump(mode='json')}
+        research_context = validate_idea_extra(request.extra)
+        from app.bridge.evaluation_policy import policy_for_task
+        evaluation_policy = policy_for_task(request.extra.get("evaluation_policy"))
+        skills = request.extra.get("selected_skills_by_agent", {})
+        if (not isinstance(skills, dict) or set(skills) - set(LINEAR_STAGES)
+                or any(not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names)
+                       for names in skills.values())):
+            raise ValueError("selected_skills_by_agent must map pipeline agent names to explicit skill names")
+        execution_context = request.extra.get("execution_context", {})
+        if not isinstance(execution_context, dict) or any(not isinstance(key, str) or not isinstance(value, str)
+                                                        or not value.strip() for key, value in execution_context.items()):
+            raise ValueError("execution_context must contain named nonempty text")
+        settings = get_settings()
+        if settings.is_production and request.auto_approve:
+            raise ValueError("production mode cannot create auto-approved runs")
+        if research_contract is None:
+            assert_ready_for_run(project=request.project)
+            from app.bridge.project_execution_config import require_project_execution
+            require_project_execution(request.project)
+        from app.harness.context.folder_context import load_folder_context
+        from app.harness.agent_loop.trace import atomic_json
+        # A contract-backed project is not an alias for mutable global project
+        # metadata. Execution remains blocked until its adapters are bound.
+        folder_context = load_folder_context(request.project) if research_contract is None else None
+        run = self.run_store.create(
+            task=request.task,
+            project=request.project,
+            entrypoint=request.entrypoint,
+            user_request=request.user_request,
+            data_source=request.data_source,
+            experiment_id=str(request.extra.get("experiment_id", "") or ""),
+        )
+        if on_run_allocated is not None:
+            on_run_allocated(run)
+        run.meta["evaluation_policy"] = evaluation_policy
+        run.meta["selected_skills_by_agent"] = skills
+        atomic_json(run.root / "run_meta.json", run.meta)
+        if research_contract is not None:
+            persist_run_research_contract(run, research_contract)
+        if folder_context is not None:
+            atomic_json(run.root / "input/folder_context.v1.json", folder_context)
+        graph = (
+            build_standalone(request.entrypoint)
+            if request.standalone and request.entrypoint != "pipeline"
+            else build_pipeline(request.entrypoint)
+        )
+        session = RunSession(run=run, graph=graph, request=request, bus=self.bus)
+        self._sessions[run.run_id] = session
+        context_sha = archive_research_context(run, research_context)
+        if context_sha is not None:
+            request.extra = {**request.extra, "research_context_sha256": context_sha}
+        if request.extra.get('evolution') is not None:
+            from app.bridge.evolution_service import freeze_evolution
+            request.extra = {**request.extra,
+                'evolution_contract_sha256': freeze_evolution(run, request.extra['evolution'])}
+        self._persist_request_extra(run, request.extra)
+        TraceRecorder(run).ensure_manifest()
+        if self.langgraph_runtime.enabled():
+            self.langgraph_runtime.write_manifest(run=run, graph=graph)
+        self._persist_state(session, status="created")
+        self._contract_execution_block(session)
+        return session
+
+    def correct_initial_scope(self, run_id: str, *, project: str, entrypoint: str,
+                              user_request: str, reason: str, routing: dict[str, Any]) -> dict[str, Any]:
+        """Correct a user-rejected early route without allocating a new budget/run."""
+        session = self.session(run_id)
+        if session.run.project != project or session.read_only or CONTRACT_HASH_KEY in session.request.extra:
+            return {'ok': False, 'status': 'scope_correction_blocked', 'error': '任务归属、历史状态或冻结合同不允许原地改写。'}
+        if entrypoint not in {'experiment', 'coding'} or not user_request.strip() or not reason.strip():
+            return {'ok': False, 'error': '入口纠正必须指定 experiment/coding、用户纠正的目标与原因。'}
+        if routing.get('ok') is not True or not routing.get('evidence'):
+            return {'ok': False, 'error': '纠正代码相关任务前必须核对当前源文件。'}
+        if self.owned_tasks.active(run_id) is not None or self.owned_tasks.closing:
+            return {'ok': False, 'status': 'scope_correction_active', 'error': '任务仍在运行，请先停止并核对，再纠正入口。'}
+        if session.termination and session.termination.get('cleanup_complete') is not True:
+            return {'ok': False, 'error': '停止清理尚未完成，不能改写入口。'}
+        target_index = LINEAR_STAGES.index(entrypoint)
+        for key, state in session.graph.all_states().items():
+            index = LINEAR_STAGES.index(parse_node_key(key).stage)
+            allowed = {NodeState.PENDING, NodeState.SKIPPED}
+            if index < target_index:
+                allowed.add(NodeState.FAILED)
+            if state not in allowed:
+                return {'ok': False, 'error': '已有阶段产物待审核、已完成，或目标及后续阶段已开始；不能覆盖这些工作。'}
+        if any(list((session.run.root / stage).glob('*.approved.md')) for stage in LINEAR_STAGES):
+            return {'ok': False, 'error': '已有批准产物，不能用入口纠正丢弃原审批。'}
+        from app.harness.llm.accounting import RunModelBudget
+        ledger = session.run.root / 'resources/model_budget.v1.json'
+        if ledger.is_file():
+            budget = RunModelBudget(session.run.root).recovery_snapshot()
+            if any(row.get('status') in {'in_flight', 'reconciliation_required'}
+                   for row in budget.get('requests', {}).values()):
+                return {'ok': False, 'error': '存在结果未确认的模型调用，需先核对；入口纠正不会清空用量。'}
+        from app.harness.runtime.task_contract import TaskEnvelope
+        for path in (session.run.root / 'input/task_contracts').glob('*.json'):
+            task = TaskEnvelope.model_validate_json(path.read_text())
+            if task.run_id != run_id or task.project != project:
+                return {'ok': False, 'error': '原任务检查点归属无法核验。'}
+            checkpoint = session.run.root / 'agent_traces' / task.agent / task.invocation_id / 'checkpoint.json'
+            if not checkpoint.resolve().is_relative_to(session.run.root.resolve()):
+                return {'ok': False, 'error': '原任务检查点路径无法核验。'}
+            if checkpoint.is_file():
+                state = json.loads(checkpoint.read_text())
+                if state.get('pending') == 'tool' or state.get('pending_batch'):
+                    return {'ok': False, 'error': '存在结果未确认的工具操作，不能重排任务。'}
+        from app.harness.persistence import atomic_write_json, atomic_write_text
+        correction_id = uuid4().hex
+        record = {'schema_id': 'run.scope_correction.v1', 'id': correction_id,
+                  'run_id': run_id, 'project': project, 'reason': reason,
+                  'created_at': datetime.now(timezone.utc).isoformat(),
+                  'previous_revision': session.state_revision, 'previous_request': asdict(session.request),
+                  'previous_graph': session.graph.to_dict(), 'previous_termination': session.termination,
+                  'entrypoint': entrypoint, 'user_request': user_request, 'routing': routing}
+        record_path = session.run.root / 'input/scope_corrections' / (correction_id + '.json')
+        atomic_write_json(record_path, record)
+        # Creation identity remains immutable in the state journal. The graph
+        # and explicit active scope describe the corrected operational entry.
+        session.request = replace(session.request,
+            user_request=user_request, extra={**session.request.extra, 'routing': routing,
+                                             'scope_entrypoint': entrypoint,
+                                             'scope_correction_id': correction_id})
+        session.graph = (build_standalone(entrypoint) if session.request.standalone
+                         else build_pipeline(cast(EntryPoint, entrypoint)))
+        session.termination = None
+        self._persist_state(session, status='created')
+        session.run.meta.update(active_entrypoint=entrypoint, scope_correction_id=correction_id)
+        atomic_write_json(session.run.root / 'run_meta.json', session.run.meta)
+        atomic_write_text(session.run.root / 'input/user_request.md', user_request)
+        self._persist_request_extra(session.run, session.request.extra)
+        if self.langgraph_runtime.enabled():
+            self.langgraph_runtime.write_manifest(run=session.run, graph=session.graph)
+        return {'ok': True, 'run_id': run_id, 'entrypoint': entrypoint, 'status': 'scope_corrected',
+                'scope_correction_id': correction_id, 'history_preserved': True,
+                'cumulative_budget_preserved': True,
+                'states': {key: state.value for key, state in session.graph.all_states().items()}}
+
+    def session(self, run_id: str) -> RunSession:
+        if run_id not in self._sessions:
+            recovered = self._recover_session(run_id)
+            if recovered is None:
+                raise KeyError(run_id)
+            return recovered
+        session = self._sessions[run_id]
+        self._contract_execution_block(session)
+        return session
+
+    @staticmethod
+    def _contract_execution_block(session: RunSession) -> dict[str, Any] | None:
+        admission = research_execution_admission(session.run, session.request.extra)
+        if admission is None:
+            return None
+        reason = ("research_contract_integrity_error" if any(
+            item.code == "research_contract_integrity_error" for item in admission.blockers)
+            else "research_contract_execution_pending")
+        if not session.read_only or (session.read_only_reason or "").startswith("research_contract_"):
+            session.read_only = True
+            session.read_only_reason = reason
+        return {"ok": False, "status": "contract_execution_blocked", "run_id": session.run.run_id,
+                "research_started": False, "execution_admission": admission.model_dump(mode="json")}
+
+    def discard_session(self, run_id: str) -> None:
+        self._sessions.pop(run_id, None)
+
+    def run_control(self, run_id: str) -> dict[str, Any]:
+        """Process-local cancellation facts only, independent of saved state."""
+        active = self.owned_tasks.active(run_id) is not None
+        stopping = self.owned_tasks.stopping(run_id)
+        session = self._sessions.get(run_id)
+        termination = session.termination if session is not None else None
+        state_error = session.stop_state_error if session is not None else None
+        contract = session is not None and session.run.meta.get("research_task_sha256") is not None
+        stop_result = self.research_stops.results.get(run_id)
+        if stop_result is not None:
+            contract = True
+            termination = stop_result.get("termination", termination)
+            if stop_result.get("state_persisted") is False:
+                state_error = {"type": "ResearchStopStateError", "phase": "request",
+                               "message": "research dispatch barrier could not be persisted"}
+        if contract and termination is not None and termination.get("scope") == "research_contract":
+            stopping = not bool(termination.get("cleanup_complete"))
+        elif termination is not None and termination.get("cleanup_complete") and state_error is None:
+            # Keep the internal cancellation barrier until explicit recovery,
+            # but do not present completed cleanup as an active stop operation.
+            stopping = False
+        if stopping and session is None and not contract:
+            state_error = {"type": "MissingRunSession", "phase": "request",
+                           "message": "owned task has no in-memory persistence session"}
+        return {"run_id": run_id, "owned_task_active": active, "stopping": stopping,
+            "owned_task_done": not active if active or stopping or termination is not None else None,
+            "cleanup_complete": bool(termination.get("cleanup_complete")) if termination is not None else None,
+            "state_persisted": False if state_error is not None else True if termination is not None else None,
+            "state_persistence_error": state_error,
+            "research_stop": stop_result,
+            "available_actions": ["stop"] if active or contract and not (termination or {}).get("cleanup_complete") else []}
+
+    def migrate_run_state(self, run_id: str) -> dict[str, Any]:
+        """Explicitly adopt validated legacy state without scheduling execution."""
+        run = self.run_store.get(run_id)
+        if run is None:
+            raise KeyError(run_id)
+        if run.entrypoint not in _ORCHESTRATED_ENTRYPOINTS:
+            return {"ok": False, "status": "service_owned", "run_id": run_id}
+        if self.owned_tasks.active(run_id) is not None or self.owned_tasks.closing:
+            return {"ok": False, "status": "driver_busy", "run_id": run_id}
+        store = RunStateStore(run)
+        snapshot = store.load()
+        if snapshot is None:
+            return {"ok": False, "status": "missing_persisted_state", "run_id": run_id}
+        if not snapshot.migration_required:
+            # Another process may have completed migration after this process
+            # cached the old read-only session. Re-read it on the next access.
+            self.discard_session(run_id)
+            return {"ok": True, "status": "already_current", "run_id": run_id,
+                    "revision": snapshot.revision, "research_started": False}
+        store.migrate_legacy()
+        self.discard_session(run_id)
+        session = self.session(run_id)
+        return {"ok": True, "status": "migrated", "run_id": run_id,
+                "revision": session.state_revision, "read_only": session.read_only,
+                "research_started": False}
+
+    # ---------------------------------------------------------------- drive
+
+    def _stopping(self, session: RunSession) -> bool:
+        return session.termination is not None or self.owned_tasks.stopping(session.run.run_id)
+
+    def _spawn_owned(self, session: RunSession, operation: str,
+                     factory: Callable[[], Awaitable[None]]) -> bool:
+        if self._contract_execution_block(session) is not None:
+            return False
+        if session.read_only or self._stopping(session):
+            return False
+        return self.owned_tasks.spawn(session.run.run_id, operation, factory,
+                                      finished=lambda: self._finish_owned_stop(session),
+                                      lock_path=session.run.root / "runtime.driver.lock")
+
+    def start_owned_run(self, run_id: str) -> dict[str, Any]:
+        session = self.session(run_id)
+        if blocked := self._contract_execution_block(session):
+            return blocked
+        if self.owned_tasks.active(run_id) is not None:
+            return {"ok": True, "status": "already_running", "run_id": run_id}
+        if session.read_only or self._stopping(session) or self.owned_tasks.closing:
+            return {"ok": False, "status": "not_startable", "run_id": run_id}
+        if any(state in {NodeState.RUNNING, NodeState.WAITING_REVIEW, NodeState.APPROVED}
+               for state in session.graph.all_states().values()):
+            return {"ok": False, "status": "unowned_existing_execution", "run_id": run_id,
+                    "error": "inspect original execution; start does not replay or recover unknown work"}
+        if session.graph.is_complete():
+            return {"ok": False, "status": "already_finished", "run_id": run_id}
+        started = self._spawn_owned(session, "start", lambda: self.run(run_id))
+        return {"ok": started, "status": "started" if started else "not_startable", "run_id": run_id}
+
+    def resume_owned_run(self, run_id: str) -> dict[str, Any]:
+        """Explicitly continue persisted loops; never turn start into an implicit replay."""
+        from app.bridge.task_runtime import resumable_task
+        session = self.session(run_id)
+        if blocked := self._contract_execution_block(session):
+            return blocked
+        if self.owned_tasks.active(run_id) is not None:
+            return {"ok": True, "status": "already_running", "run_id": run_id}
+        if session.read_only or self._stopping(session) or self.owned_tasks.closing:
+            return {"ok": False, "status": "not_resumable", "run_id": run_id}
+        candidates = [key for key, state in session.graph.all_states().items()
+                      if state in {NodeState.RUNNING, NodeState.FAILED}
+                      and key == self._latest_node_for_stage(session, parse_node_key(key).stage)]
+        if not candidates:
+            return {"ok": False, "status": "no_interrupted_loop", "run_id": run_id,
+                    "error": "use start for pending work or the review API for completed drafts"}
+        try:
+            tasks = {key: resumable_task(session.run, key) for key in candidates}
+        except (OSError, ValueError, KeyError) as exc:
+            return {"ok": False, "status": "recovery_blocked", "run_id": run_id, "error": str(exc)}
+
+        async def resume() -> None:
+            from app.harness.llm.accounting import run_resource_scope
+            with run_resource_scope(session.run.root):
+                for key, task in tasks.items():
+                    # Repeat under the process-wide driver lock before any mutation.
+                    if resumable_task(session.run, key) != task:
+                        raise ValueError("resume contract changed after admission")
+                    self._resume_invocations[(run_id, key)] = task.invocation_id
+                    session.run.write_event("agent_events", {"event": "agent.resume_requested", "run_id": run_id,
+                        "node": key, "invocation_id": task.invocation_id, "task_id": task.task_id})
+                    try:
+                        await self._advance(session, key)
+                    finally:
+                        self._resume_invocations.pop((run_id, key), None)
+                await self._run(run_id)
+
+        started = self._spawn_owned(session, "resume", resume)
+        return {"ok": started, "status": "resuming" if started else "driver_busy", "run_id": run_id,
+                "invocations": {key: task.invocation_id for key, task in tasks.items()}}
+
+    def _finish_owned_stop(self, session: RunSession) -> None:
+        """Commit cancellation only after the owned coroutine's real cleanup."""
+        if session.termination is not None and session.termination.get("scope") == "research_contract":
+            # The contract controller also verifies stage leases, job receipts
+            # and active accounting before committing the terminal graph.
+            return
+        if session.stop_state_error is not None or session.termination is None or session.termination.get("cleanup_complete"):
+            return
+        termination = dict(session.termination)
+        graph = RunGraph.from_dict(deepcopy(session.graph.to_dict()))
+        interrupted = list(termination.get("interrupted_nodes", []))
+        for key, state in graph.all_states().items():
+            if state != NodeState.RUNNING:
+                continue
+            interrupted.append(key)
+            graph.transition(key, NodeState.FAILED)
+            graph.nodes[key].metadata["termination"] = {
+                "type": "cancelled", "reason": termination["reason"],
+            }
+        termination.update(cleanup_complete=True, interrupted_nodes=interrupted,
+                           finished_at=datetime.now(tz=timezone.utc).isoformat(), automatic_resume=False)
+        states = graph.all_states().values()
+        status = ("failed" if NodeState.FAILED in states else "waiting_review" if NodeState.WAITING_REVIEW in states
+                  else "completed" if graph.is_complete() else "stopped")
+        prior_termination = session.termination
+        session.termination = termination
+        try:
+            self._persist_state(session, status=status, graph=graph)
+        except Exception as exc:
+            if session.termination is termination:
+                # Reload can also fail when the database disappeared. Discard
+                # our uncommitted cleanup_complete candidate in that case.
+                session.termination = prior_termination
+            # The owned coroutine has ended, but the durable cleanup boundary
+            # could not commit. Preserve that distinction and release its lock.
+            self._record_stop_state_error(session, exc, phase="cleanup")
+            return
+        # agent_state is already in SQLite's outbox, including when this callback
+        # runs synchronously after cancellation before an async publisher runs.
+        session.run.write_event("run_lifecycle", {"event": "run.cancelled", "run_id": session.run.run_id,
+                                                 "termination": dict(termination)})
+
+    @staticmethod
+    def _record_stop_state_error(session: RunSession, error: Exception, *, phase: str) -> None:
+        # Process-local error evidence must not masquerade as a committed run
+        # termination. _persist_state already reloads/blocks the cached session.
+        session.stop_state_error = {"type": type(error).__name__, "phase": phase,
+                                    "message": "owned task stop state could not be persisted"}
+        logger.error("Owned stop state persistence failed: run={} phase={} type={}",
+                     session.run.run_id, phase, type(error).__name__)
+
+    @staticmethod
+    def _stop_result(session: RunSession, *, complete: bool) -> dict[str, Any]:
+        if session.stop_state_error is not None:
+            return {"ok": False, "status": "stop_state_error" if complete else "stop_incomplete",
+                    "run_id": session.run.run_id, "owned_task_done": complete, "state_persisted": False,
+                    "state_persistence_error": dict(session.stop_state_error),
+                    "termination": dict(session.termination or {})}
+        return {"ok": complete, "status": "stopped" if complete else "stop_incomplete",
+                "run_id": session.run.run_id, "termination": dict(session.termination or {})}
+
+    def _request_owned_stop(self, run_id: str, *, reason: str) -> tuple[RunSession, asyncio.Task[None]] | dict[str, Any]:
+        """Always signal owned cancellation, even when durable state fails."""
+        task = self.owned_tasks.active(run_id)
+        # Do not recover a historical run just to mutate its state at stop.
+        session = self._sessions.get(run_id)
+        if task is None or session is None:
+            if session is not None and self.owned_tasks.stopping(run_id):
+                if session.stop_state_error is not None:
+                    return self._stop_result(session, complete=True)
+                if session.termination:
+                    self._finish_owned_stop(session)
+                    return self._stop_result(session, complete=True)
+            return {"ok": False, "status": "not_owned", "run_id": run_id,
+                    "error": "no live task owned by this process; historical execution was not changed"}
+        try:
+            if session.termination is None and session.stop_state_error is None:
+                session.termination = {"type": "cancelled", "reason": reason[:500], "scope": "owned_async_tasks",
+                    "requested_at": datetime.now(tz=timezone.utc).isoformat(), "cleanup_complete": False,
+                    "automatic_resume": False}
+                self._persist_state(session, status="cancelling")
+        except Exception as exc:
+            self._record_stop_state_error(session, exc, phase="request")
+        finally:
+            # In particular, SQLite/CAS errors must not leave the actual task
+            # alive. cancel_once also protects asynchronous cleanup on retries.
+            self.owned_tasks.cancel_once(run_id)
+        return session, task
+
+    async def _wait_owned_stop(self, requested: tuple[RunSession, asyncio.Task[None]] | dict[str, Any],
+                               *, grace_seconds: float) -> dict[str, Any]:
+        if isinstance(requested, dict):
+            return requested
+        session, task = requested
+        complete = await self.owned_tasks.wait(task, timeout=grace_seconds)
+        if complete:
+            self._finish_owned_stop(session)
+            if session.stop_state_error is None:
+                await self.replay_state_events(session.run.run_id)
+        return self._stop_result(session, complete=complete)
+
+    async def stop_owned_run(self, run_id: str, *, reason: str = "user_request",
+                             grace_seconds: float = 10.0) -> dict[str, Any]:
+        if not 0 <= grace_seconds <= 60:
+            raise ValueError("stop grace must be in [0,60] seconds")
+        self.execution_preparations.signal_cancel(run_id)
+        try:
+            return await self._stop_owned_run(run_id, reason=reason, grace_seconds=grace_seconds)
+        finally:
+            await self.execution_preparations.cancel(run_id)
+
+    async def _stop_owned_run(self, run_id: str, *, reason: str, grace_seconds: float) -> dict[str, Any]:
+        if not 0 <= grace_seconds <= 60:
+            raise ValueError("stop grace must be in [0,60] seconds")
+        task = self.owned_tasks.active(run_id)
+        if task is not None and run_id not in self._sessions:
+            # A removed registry/session record must not strand a live task.
+            # Cancellation remains real; durable cleanup cannot be claimed.
+            self.owned_tasks.cancel_once(run_id)
+            complete = await self.owned_tasks.wait(task, timeout=grace_seconds)
+            return {"ok": False, "status": "stop_state_error" if complete else "stop_incomplete",
+                    "run_id": run_id, "owned_task_done": complete, "state_persisted": False,
+                    "state_persistence_error": self.run_control(run_id)["state_persistence_error"]}
+        cached = self._sessions.get(run_id)
+        run = cached.run if cached is not None else self.run_store.get(run_id)
+        if run is not None:
+            from app.harness.runtime.state_journal import StateJournal
+            contract = run.meta.get("research_task_sha256") is not None
+            if cached is not None:
+                contract = contract or cached.request.extra.get("research_task_sha256") is not None
+            if not contract and cached is None:
+                authority = StateJournal.from_authority(run.root, run_id=run.run_id)
+                saved = authority.read().get("request", {}) if authority is not None else {}
+                extra = saved.get("extra", {}) if isinstance(saved, dict) else {}
+                contract = isinstance(extra, dict) and extra.get("research_task_sha256") is not None
+            if contract:
+                def update_cache(payload: dict[str, Any]) -> None:
+                    session = self._sessions.get(run_id)
+                    if session is not None:
+                        snapshot = RunStateStore(run)._snapshot(payload)
+                        session.graph = snapshot.graph
+                        session.termination = snapshot.termination
+                        session.state_revision = snapshot.revision
+                return await self.research_stops.request(run, self.owned_tasks, reason=reason, on_state=update_cache)
+        requested = self._request_owned_stop(run_id, reason=reason)
+        return await self._wait_owned_stop(requested, grace_seconds=grace_seconds)
+
+    async def shutdown_owned_runs(self, *, grace_seconds: float = 10.0) -> list[dict[str, Any]]:
+        if not 0 <= grace_seconds <= 60:
+            raise ValueError("stop grace must be in [0,60] seconds")
+        self.owned_tasks.closing = True
+        await self.execution_preparations.shutdown()
+        results = list(await asyncio.gather(*(self.stop_owned_run(run_id, reason="server_shutdown",
+            grace_seconds=grace_seconds) for run_id in self.owned_tasks.run_ids())))
+        await self.research_stops.wait(timeout=grace_seconds)
+        return [self.research_stops.results.get(item["run_id"], item) for item in results]
+
+    async def run(self, run_id: str) -> None:
+        from app.harness.llm.accounting import run_resource_scope
+        with run_resource_scope(self.session(run_id).run.root):
+            await self._run(run_id)
+
+    async def _run(self, run_id: str) -> None:
+        session = self.session(run_id)
+        if self._contract_execution_block(session) is not None:
+            raise ValueError("Research contract execution is blocked until all declared boundaries are enforced")
+        if session.read_only:
+            raise ValueError("read-only historical or service-owned run cannot execute through the orchestrator")
+        if self._stopping(session):
+            return
+        graph = session.graph
+        await self.replay_state_events(run_id)
+        if not session.request.extra.get('research_task_sha256') and not session.request.extra.get('evolution'):
+            from app.bridge.coding_execution import restore_pending_repairs
+            restore_pending_repairs(session.run, graph)
+        from app.bridge.evolution_service import load_evolution, record_execution, record_failed_execution
+        if load_evolution(session.run) is not None:
+            latest = self._latest_node_for_stage(session, 'execution')
+            if latest is not None and graph.state(latest) in {NodeState.DONE, NodeState.FAILED}:
+                # Recover a crash between completed measurement, evidence-card
+                # persistence and graph extension. Completed jobs stay intact.
+                evolution_decision = (record_execution(session.run, attempt=parse_node_key(latest).attempt)
+                    if graph.state(latest) == NodeState.DONE else record_failed_execution(
+                        session.run, attempt=parse_node_key(latest).attempt, error='Recovered failed candidate execution'))
+                if evolution_decision is not None and evolution_decision['continue'] and (session.request.auto_approve or session.request.review_mode == 'commander'):
+                    self._append_evolution_attempt(session, latest, evolution_decision)
+        self._persist_state(session, status="running")
+        await self._publish_state(session, channel="run.lifecycle", payload={
+            "event": "run.started",
+            "run_id": run_id,
+            "project": session.run.project,
+            "entrypoint": session.request.entrypoint,
+        })
+
+        max_loops = len(graph.nodes) * 4 + 4
+        loops = 0
+        while not graph.is_complete():
+            if self._stopping(session):
+                return
+            if session.waiting_for_feedback:
+                self._persist_state(session, status="waiting_feedback")
+                return
+            if self._stage_limit_reached(session):
+                self._persist_state(session, status="waiting_feedback")
+                return
+            ready = ready_batch(graph, self.max_parallel_nodes)
+            if not ready:
+                await asyncio.sleep(0)
+                # If no node is ready and we're not complete, that means
+                # there's a node stuck in WAITING_REVIEW or RUNNING. For V0
+                # the external workflow driver advances those states.
+                non_terminal = [
+                    k for k, s in graph.all_states().items()
+                    if s in (NodeState.RUNNING, NodeState.WAITING_REVIEW)
+                ]
+                if not non_terminal:
+                    break
+                await asyncio.sleep(0.05)
+                continue
+            loops += 1
+            max_loops = max(max_loops, len(graph.nodes) * 4 + 4)
+            if loops > max_loops:
+                logger.error("orchestrator stuck after {} loops", loops)
+                break
+            async with asyncio.TaskGroup() as group:
+                for node_key in ready:
+                    if self._stopping(session):
+                        break
+                    group.create_task(self._advance(session, node_key), name=f"node:{run_id}:{node_key}")
+            if session.waiting_for_feedback:
+                self._persist_state(session, status="waiting_feedback")
+                return
+
+        if self._stopping(session):
+            return
+        quality_gate = await self._write_evaluation_scorecard(session)
+        states = graph.all_states()
+        failed_nodes = sorted(
+            key for key, state in states.items() if state == NodeState.FAILED
+        )
+        from app.bridge.coding_execution import repaired_failure
+        failed_nodes = [key for key in failed_nodes if not repaired_failure(graph, key)]
+        quality_blocked = quality_gate.get("completion_allowed") is False
+        if session.request.extra.get('evolution'):
+            from app.bridge.evolution_service import evolution_view
+            view = evolution_view(session.run)
+            if view is not None and view['status'] == 'goal_met':
+                # Earlier failed candidates remain visible. Only failures with
+                # an explicit completed repair route cease to fail the task.
+                failed_nodes = [key for key in failed_nodes if not any(edge.src == key and edge.allow_failure
+                    and graph.state(edge.dst) == NodeState.DONE for edge in graph.edges)]
+        terminal_status = "failed" if failed_nodes or quality_blocked else "completed"
+        lifecycle_event = "run.failed" if terminal_status == "failed" else "run.completed"
+        self._persist_state(session, status=terminal_status)
+        await self._publish_state(session, channel="run.lifecycle", payload={
+            "event": lifecycle_event,
+            "run_id": run_id,
+            "states": {key: state.value for key, state in states.items()},
+            "failed_nodes": failed_nodes,
+            "quality_gate": quality_gate,
+            "failure_summary": (
+                f"{len(failed_nodes)} run node(s) failed"
+                if failed_nodes
+                else "run completion quality gate rejected the result" if quality_blocked else None
+            ),
+        })
+
+    async def _write_evaluation_scorecard(self, session: RunSession) -> dict[str, Any]:
+        try:
+            from app.bridge.evaluation_service import emit_scorecard_event
+            from app.harness.evaluation.aggregation import write_scorecard
+
+            path = write_scorecard(
+                run_root=session.run.root,
+                run_id=session.run.run_id,
+                project=session.run.project,
+            )
+            event_path = path.relative_to(session.run.root).as_posix()
+            session.run.write_event(
+                "agent_events",
+                {
+                    "event": "evaluation.scorecard_written",
+                    "agent": "evaluation",
+                    "run_id": session.run.run_id,
+                    "path": event_path,
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+            await emit_scorecard_event(
+                run=session.run,
+                path=event_path,
+                bus=session.bus,
+            )
+            gate_path = session.run.subdir("events") / "evaluation_quality_gate.json"
+            return json.loads(gate_path.read_text())  # type: ignore[no-any-return]
+        except Exception as exc:
+            logger.warning(
+                "evaluation scorecard write failed: run={} error={}",
+                session.run.run_id,
+                exc,
+            )
+            from app.bridge.evaluation_policy import policy_for_task
+            policy = policy_for_task(session.run.meta.get("evaluation_policy"))
+            enforced = policy["run"]["completion_gate"]["mode"] == "enforce"
+            return {"completion_allowed": not enforced, "quality_status": "error",
+                    "error": "evaluation scorecard unavailable", "scientific_validated": False}
+
+    async def _advance(self, session: RunSession, node_key: str) -> None:
+        if self._stopping(session):
+            return
+        # A boundary can be selected after this node was scheduled but before
+        # it starts. Recheck at the actual dispatch boundary without replaying.
+        if self._stage_limit_reached(session):
+            self._persist_state(session, status="waiting_feedback")
+            return
+        await self._transition(session, node_key, NodeState.RUNNING)
+        if not await self._run_node_runner(session, node_key):
+            return
+        # default flow: agent finishes -> waiting_review -> (HITL or auto) -> approved -> done
+        if session.graph.state(node_key) == NodeState.RUNNING:
+            await self._transition(session, node_key, NodeState.WAITING_REVIEW)
+            self._refresh_idea_acceptance_report(session, node_key)
+        if session.graph.state(node_key) == NodeState.WAITING_REVIEW:
+            await self._await_hitl_or_auto(session, node_key)
+            if not self._stopping(session):
+                await self._complete_approved_node(session, node_key)
+
+    def _refresh_idea_acceptance_report(
+        self,
+        session: RunSession,
+        node_key: str,
+    ) -> None:
+        if parse_node_key(node_key).stage != "idea":
+            return
+        try:
+            if not self.registry.has("idea"):
+                return
+            agent = self.registry.get("idea")
+            write_acceptance_report = getattr(agent, "write_acceptance_report", None)
+            if not callable(write_acceptance_report):
+                return
+
+            report_path = write_acceptance_report(
+                run=session.run,
+                node_key=node_key,
+            )
+            session.run.write_event(
+                "agent_events",
+                {
+                    "event": "idea.acceptance_report_refreshed",
+                    "agent": "idea",
+                    "node": node_key,
+                    "path": report_path.relative_to(session.run.root).as_posix(),
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                },
+            )
+        except Exception as exc:  # pragma: no cover - report refresh is non-blocking
+            logger.warning(
+                "idea acceptance report refresh failed: run={} node={} error={}",
+                session.run.run_id,
+                node_key,
+                exc,
+            )
+
+    async def _run_node_runner(
+        self,
+        session: RunSession,
+        node_key: str,
+        *,
+        revision_reason: str = "",
+    ) -> bool:
+        if await self._repair_evolution_design(session, node_key):
+            return False
+        runner = session.runners.get(node_key) or self._default_runner(node_key)
+        node_kind = session.graph.nodes[node_key].kind
+        recorder = TraceRecorder(session.run)
+        try:
+            with recorder.start_span(
+                name=f"node:{node_key}",
+                kind=node_kind,
+                attributes={
+                    "run_id": session.run.run_id,
+                    "node": node_key,
+                    "stage": parse_node_key(node_key).stage,
+                    "attempt": parse_node_key(node_key).attempt,
+                    "revision": bool(revision_reason),
+                },
+            ):
+                if revision_reason and node_key not in session.runners:
+                    from app.bridge.agent_runner import run_agent_node
+
+                    await run_agent_node(
+                        session.run,
+                        node_key,
+                        bus=session.bus,
+                        revision_reason=revision_reason,
+                        registry=self.registry,
+                    )
+                else:
+                    await runner(session.run, node_key)
+        except Exception as exc:
+            from app.harness.runtime.task_contract import FailureEnvelope
+            from app.harness.agent_loop.trace import atomic_json
+            details = getattr(exc, "reason", {})
+            code = str(details.get("code", "agent_node_failed")) if isinstance(details, dict) else "agent_node_failed"
+            failure = FailureEnvelope(task_id=f"{session.run.run_id}:{node_key}", code=code,
+                message=str(exc) or type(exc).__name__,
+                invocation_id=self._resume_invocations.get((session.run.run_id, node_key)),
+                outcome_known=code == "handoff_context_missing")
+            atomic_json(session.run.root / "input/node_failures" / (node_key + ".json"), failure.model_dump())
+            await self._transition(session, node_key, NodeState.FAILED)
+            await self._publish_state(
+                session,
+                channel=f"run.{session.run.run_id}.failure",
+                payload={"node": node_key, "error": str(exc), "failure": failure.model_dump()},
+            )
+            return False
+        return True
+
+    async def _repair_evolution_design(self, session: RunSession, node_key: str) -> bool:
+        """Route an incompatible design back to Experiment before coding runs."""
+        if parse_node_key(node_key).stage not in {'coding', 'execution'}:
+            return False
+        from app.bridge.evolution_service import load_evolution, _state, _save
+        contract = load_evolution(session.run)
+        plan = session.run.root / 'experiment/experiment_plan.approved.md'
+        if contract is None or not plan.is_file():
+            return False
+        from app.harness.evolution import evolution_plan_errors
+        from app.harness.schema.frontmatter_parser import parse
+        errors = evolution_plan_errors(contract, parse(plan.read_text()).metadata)
+        if not errors:
+            return False
+        from app.harness.runtime.task_contract import FailureEnvelope
+        from app.harness.agent_loop.trace import atomic_json
+        identity = parse_node_key(node_key)
+        failure = FailureEnvelope(task_id=f'{session.run.run_id}:{node_key}',
+            code='evolution_design_requires_revision', message='; '.join(errors), outcome_known=True,
+            evidence_refs=['experiment/experiment_plan.approved.md', 'input/evolution_contract.v1.json'])
+        atomic_json(session.run.root / 'input/node_failures' / (node_key + '.json'), failure.model_dump())
+        if session.graph.state(node_key) != NodeState.RUNNING:
+            await self._transition(session, node_key, NodeState.RUNNING)
+        await self._transition(session, node_key, NodeState.FAILED)
+        state = _state(session.run)
+        state['last_design_repair'] = {'node': node_key, 'errors': errors,
+            'instruction': 'Revise only the current executable batch. Keep the approved research mechanism and frozen goal unchanged.'}
+        _save(session.run, state)
+        session.graph.nodes[node_key].metadata['evolution_design_repair'] = True
+        abandoned = attempt_key('execution', identity.attempt)
+        if abandoned in session.graph.nodes and session.graph.state(abandoned) == NodeState.PENDING:
+            session.graph.skip(abandoned)
+        repairs = sum(bool(node.metadata.get('evolution_design_repair')) for node in session.graph.nodes.values())
+        if repairs > 2:
+            self._persist_state(session, status='failed')
+            return True
+        decision = {'target': 'experiment', 'next_attempt': identity.attempt + 1,
+            'continue': True, 'reason': failure.message}
+        self._append_evolution_attempt(session, node_key, decision)
+        await self._publish_state(session, channel=f'run.{session.run.run_id}.evolution', payload={
+            'event': 'evolution.design_revision', 'node': node_key, 'reason': failure.message,
+            'message': '当前批次交接不兼容，正在修正实验清单；目标与研究方案保留。'})
+        return True
+
+    async def _await_hitl_or_auto(self, session: RunSession, node_key: str) -> None:
+        """Wait for a human review decision, or auto-approve.
+
+        When ``request.auto_approve`` is True we keep the legacy Phase 2/3
+        behaviour (used by smoke tests / no-frontend pipelines). Otherwise we
+        register a ReviewSession and block on its approval/rejection event.
+        """
+        if self._stopping(session):
+            return
+        if session.request.auto_approve or parse_node_key(node_key).stage == "execution":
+            # Deterministic intake is validated here; configuration confirmation remains mandatory.
+            if not self._auto_promote(session, node_key):
+                await self._transition(session, node_key, NodeState.FAILED)
+                return
+            await self._transition(session, node_key, NodeState.APPROVED)
+            return
+
+        # Real HITL path
+        from app.hitl.review_session import ReviewSession, get_registry as get_review_registry
+        from app.storage.artifact_store import ArtifactStore
+
+        stage = parse_node_key(node_key).stage
+        agent = self.registry.get(stage) if self.registry.has(stage) else None
+        if agent is None:
+            logger.error("cannot approve {}: agent is not registered", node_key)
+            await self._transition(session, node_key, NodeState.FAILED)
+            return
+
+        store = ArtifactStore(session.run)
+        # Map agent name -> artifact stem via SCHEMA_TO_AGENT inverse.
+        from app.storage.artifact_store import SCHEMA_TO_AGENT
+
+        stem: str | None = None
+        agent_dir: str | None = None
+        for _, (dir_name, candidate_stem) in SCHEMA_TO_AGENT.items():
+            if dir_name == stage:
+                stem = candidate_stem
+                agent_dir = dir_name
+                break
+        if not (stem and agent_dir):
+            logger.error("cannot approve {}: no artifact schema mapping", node_key)
+            await self._transition(session, node_key, NodeState.FAILED)
+            return
+
+        latest = store.latest_candidate(agent_dir=agent_dir, stem=stem)
+        if latest is None:
+            # Agent didn't produce any artifact (real error). Halt the chain
+            # — silently auto-approving here used to skip HITL entirely.
+            logger.warning(
+                "no artifact for {}; halting run with FAILED instead of auto-approving",
+                node_key,
+            )
+            await self._transition(session, node_key, NodeState.FAILED)
+            return
+        if latest.version == "approved":
+            # Already promoted (e.g. someone hit /approve while we were
+            # transitioning). Nothing to wait for.
+            await self._transition(session, node_key, NodeState.APPROVED)
+            return
+
+        from app.bridge.evaluation_service import build_artifact_evaluation_summary
+
+        evaluation_summary = build_artifact_evaluation_summary(
+            run=session.run,
+            ref=latest,
+            node_key=node_key,
+        )
+        policy = evaluation_summary.get("policy")
+        policy_summary = policy if isinstance(policy, dict) else {}
+
+        review = ReviewSession(
+            run=session.run, agent_name=stage, artifact_ref=latest
+        )
+        await get_review_registry().register(review)
+
+        await self._publish_state(
+            session,
+            channel=f"run.{session.run.run_id}.hitl",
+            payload={
+                "event": "hitl.review_required",
+                "agent": stage,
+                "node": node_key,
+                "artifact_id": latest.path.name,
+                "version": latest.version,
+                "evaluation_summary": evaluation_summary,
+                "review_priority": str(
+                    policy_summary.get("review_priority", "normal")
+                ),
+                "recommended_action": str(
+                    policy_summary.get("action", "review_before_approval")
+                ),
+            },
+        )
+
+        while True:
+            while not (
+                review.approval_event.is_set()
+                or review.rejection_event.is_set()
+                or review.regenerate_event.is_set()
+            ):
+                if self._stopping(session):
+                    return
+                if session.request.review_mode == "commander":
+                    try:
+                        await self._managed_artifact_review(session, node_key, review)
+                    except (OSError, ValueError, RuntimeError) as error:
+                        from app.bridge.managed_review import record_state
+                        await record_state(session.run, session.bus, {"node": node_key, "kind": "artifact", "status": "needs_user",
+                            "generation": session.request.review_generation, "host_failure": True,
+                            "reason": f"托管审核无法完成，请接管审核：{error}"})
+                from app.bridge.managed_review import review_policy
+                try:
+                    interval = review_policy().poll_interval_seconds if session.request.review_mode == "commander" else 0.05
+                except (OSError, ValueError):
+                    interval = 0.05  # Keep the existing human-review wait alive on a bad managed policy.
+                await asyncio.sleep(interval)
+
+            if self._stopping(session):
+                return
+
+            if review.regenerate_event.is_set():
+                reason = review.revision_reason
+                await get_review_registry().unregister(session.run.run_id, stage)
+                await self._publish_state(
+                    session,
+                    channel=f"run.{session.run.run_id}.hitl",
+                    payload={
+                        "event": "hitl.revision_started",
+                        "agent": stage,
+                        "node": node_key,
+                        "reason": reason,
+                    },
+                )
+                await self._transition(session, node_key, NodeState.RUNNING)
+                if not await self._run_node_runner(
+                    session,
+                    node_key,
+                    revision_reason=reason,
+                ):
+                    return
+                if session.graph.state(node_key) == NodeState.RUNNING:
+                    await self._transition(
+                        session,
+                        node_key,
+                        NodeState.WAITING_REVIEW,
+                    )
+                latest = store.latest_candidate(agent_dir=agent_dir, stem=stem)
+                if latest is None:
+                    await self._transition(session, node_key, NodeState.FAILED)
+                    return
+                review = ReviewSession(
+                    run=session.run,
+                    agent_name=stage,
+                    artifact_ref=latest,
+                )
+                await get_review_registry().register(review)
+                await self._publish_state(
+                    session,
+                    channel=f"run.{session.run.run_id}.hitl",
+                    payload={
+                        "event": "hitl.review_required",
+                        "agent": stage,
+                        "node": node_key,
+                        "artifact_id": latest.path.name,
+                        "version": latest.version,
+                        "revision": True,
+                    },
+                )
+                continue
+
+            current_state = session.graph.state(node_key)
+            if review.rejection_event.is_set():
+                if current_state == NodeState.WAITING_REVIEW:
+                    await self._transition(session, node_key, NodeState.FAILED)
+            elif current_state == NodeState.WAITING_REVIEW:
+                await self._transition(session, node_key, NodeState.APPROVED)
+            await get_review_registry().unregister(session.run.run_id, stage)
+            return
+
+    async def _complete_approved_node(
+        self,
+        session: RunSession,
+        node_key: str,
+        *,
+        retry_interrupted_jobs: bool = False,
+    ) -> None:
+        if self._stopping(session) or session.graph.state(node_key) != NodeState.APPROVED:
+            return
+        if await self._repair_evolution_design(session, node_key):
+            return
+        if parse_node_key(node_key).stage == "execution":
+            if not await self._await_execution_confirmation(session, node_key):
+                return
+            if self._stopping(session) or self.owned_tasks.closing or self.execution_preparations.closing:
+                return
+            await self._transition(session, node_key, NodeState.RUNNING)
+            failure_code = 'execution_batch_failed'
+            try:
+                from app.bridge.agent_runner import _run_execution_batch, load_agent_handoff_context
+                from app.bridge.task_runtime import admit_handoffs
+                supplied, _ = load_agent_handoff_context(session.run, node_key, registry=self.registry)
+                admit_handoffs(session.run, node_key, supplied_context=supplied)
+                from app.harness.tools.registry import ToolContext
+
+                async def _batch_runner(
+                    _args: dict[str, Any],
+                    _ctx: ToolContext,
+                ) -> dict[str, Any]:
+                    from app.bridge.research_branch import research_branch_scope
+                    with research_branch_scope(session.run, node_key):
+                        if retry_interrupted_jobs:
+                            from app.bridge.execution_batch_deadline import prepare_interrupted_execution_retry
+                            prepare_interrupted_execution_retry(session.run, node_key)
+                        from app.bridge.evolution_service import evolution_code_scope
+                        with evolution_code_scope(session.run, stage='execution', attempt=parse_node_key(node_key).attempt):
+                            await _run_execution_batch(
+                                run=session.run,
+                                node_key=node_key,
+                                bus=session.bus,
+                            )
+                    summary_path = session.run.subdir("execution") / "batch_summary.json"
+                    import json
+                    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                    metrics = json.loads((session.run.subdir("execution") / "metrics.json").read_text())
+                    return {
+                        "backend": summary["runtime_backend"], "run_id": session.run.run_id,
+                        "max_concurrency": summary["max_concurrency"], "results": metrics,
+                        "failures": summary["failures"], "summary": summary,
+                    }
+
+                from app.bridge.execution_batch_deadline import execution_batch_registry
+                tool_result = await execution_batch_registry(session.run, node_key).dispatch(
+                    "execution.batch_runner",
+                    {"node_key": node_key},
+                    ToolContext(
+                        run_id=session.run.run_id,
+                        project=session.run.project,
+                        agent="bridge",
+                        extra={
+                            "run_root": str(session.run.root),
+                            "batch_runner": _batch_runner,
+                        },
+                    ),
+                )
+                if not tool_result.ok:
+                    if tool_result.status == 'timeout':
+                        failure_code = 'execution_dispatch_timeout'
+                    raise RuntimeError(tool_result.error or "execution batch failed")
+            except Exception as exc:
+                from app.harness.runtime.task_contract import FailureEnvelope
+                from app.harness.agent_loop.trace import atomic_json
+                failure = FailureEnvelope(task_id=f'{session.run.run_id}:{node_key}',
+                    code=failure_code, message=str(exc) or type(exc).__name__,
+                    retryable=True, outcome_known=False,
+                    evidence_refs=['execution/jobs', 'events/tool_events.jsonl'])
+                atomic_json(session.run.root / 'input/node_failures' / (node_key + '.json'), failure.model_dump())
+                await self._transition(session, node_key, NodeState.FAILED)
+                await self._publish_state(
+                    session,
+                    channel=f"run.{session.run.run_id}.failure",
+                    payload={"node": node_key, "error": failure.message, "failure": failure.model_dump()},
+                )
+                if await self._repair_coding_execution(session, node_key, failure.message):
+                    return
+                from app.bridge.evolution_service import record_failed_execution
+                repair = record_failed_execution(session.run, attempt=parse_node_key(node_key).attempt,
+                                                 error=failure.message)
+                if repair is not None:
+                    if repair['continue'] and (session.request.auto_approve or session.request.review_mode == 'commander'):
+                        self._append_evolution_attempt(session, node_key, repair)
+                    elif not repair['continue'] and 'writing' in session.graph.nodes:
+                        session.graph.add_edge(node_key, 'writing', allow_failure=True)
+                        self._persist_state(session, status='running')
+                    else:
+                        session.waiting_for_feedback = True
+                        self._persist_state(session, status='waiting_feedback')
+                return
+        await self._transition(session, node_key, NodeState.DONE)
+        if parse_node_key(node_key).stage == "execution":
+            from app.bridge.coding_execution import record_completed
+            try:
+                record_completed(session.run, node_key)
+            except (OSError, ValueError, KeyError) as error:
+                logger.warning('Execution completed but coupled session receipt could not be bound: {}', error)
+            await self._after_execution(session, node_key)
+
+    async def _repair_coding_execution(self, session: RunSession, node_key: str, error: str, *,
+                                      preparation: dict[str, Any] | None = None) -> bool:
+        # Sealed research contracts and evolutionary search own their own graphs.
+        # This mode cannot silently widen either authority or an evolutionary budget.
+        if (self._stopping(session) or session.read_only or session.request.extra.get('research_task_sha256')
+                or session.request.extra.get('evolution')):
+            return False
+        from app.bridge.coding_execution import repair_record, append_repair
+        try:
+            record = repair_record(session.run, session.graph, node_key, error, preparation=preparation)
+            if record is None:
+                return False
+            if session.graph.state(node_key) != NodeState.FAILED:
+                await self._transition(session, node_key, NodeState.RUNNING)
+                await self._transition(session, node_key, NodeState.FAILED)
+            append_repair(session.graph, record)
+            self._persist_state(session, status='running')
+            await self._publish_state(session, channel=f'run.{session.run.run_id}.coding', payload={
+                'event': 'coding_execution.repair_scheduled', 'node': record['target_node'],
+                'source_node': node_key, 'error': error,
+                'message': '真实执行反馈已交回原 ZCode 会话修复；研究条件保留，修订后重新核对与审批。'})
+            return True
+        except (OSError, ValueError, KeyError) as blocked:
+            from app.harness.agent_loop.trace import digest
+            signature = digest(str(blocked))
+            if session.graph.metadata(node_key).get('coding_execution_blocked') == signature:
+                return False
+            session.graph.nodes[node_key].metadata['coding_execution_blocked'] = signature
+            await self._publish_state(session, channel=f'run.{session.run.run_id}.coding', payload={
+                'event': 'coding_execution.repair_blocked', 'node': node_key,
+                'message': str(blocked), 'error': error})
+            return False
+
+    async def _await_execution_confirmation(self, session: RunSession, node_key: str) -> bool:
+        from app.bridge.execution_confirmation import confirmation_policy
+        interval = float(confirmation_policy()['poll_interval_seconds'])
+        announced = False
+        if self.owned_tasks.closing or self.execution_preparations.closing:
+            return False
+        # Preparing checks inputs only. It neither approves a plan nor starts a
+        # training job, and failures require an explicit retry rather than a loop.
+        await self.execution_preparations.start(session.run, node_key)
+        while not self._stopping(session) and not self.owned_tasks.closing and not self.execution_preparations.closing:
+            try:
+                preparation = self.execution_preparations.status(session.run, node_key)
+                if preparation['status'] == 'failed' and await self._repair_coding_execution(
+                        session, node_key, str(preparation.get('error', '运行前检查失败')), preparation=preparation):
+                    return False
+                view = preparation.get('configuration') or {'blockers': ['运行前检查正在准备。']}
+                if preparation['status'] != 'ready':
+                    view = {**view, 'blockers': [preparation.get('error') or '运行前检查尚未完成，请查看检查进度。']}
+                if not view['blockers'] and preparation['status'] == 'ready':
+                    if view['confirmed']:
+                        return not self.owned_tasks.closing and not self.execution_preparations.closing
+                    if session.request.auto_approve:
+                        await self.execution_preparations.confirm(session.run, node_key, view['token'], actor='auto_approve')
+                        saved = await self.execution_preparations.wait_confirmation(session.run, node_key)
+                        if saved['confirmed'] and not self.execution_preparations.closing and not self._stopping(session):
+                            return True
+                if session.request.review_mode == "commander" and preparation['status'] == 'ready':
+                    from app.bridge.managed_review import review_once, finish_review, execution_review_payload
+                    generation = session.request.review_generation
+                    token = view.get('token')
+                    def eligible() -> bool:
+                        return (session.request.review_mode == "commander" and session.request.review_generation == generation
+                                and not self._stopping(session) and not session.read_only
+                                and not (session.run.root / 'execution/confirmations' / (str(token) + '.json')).exists())
+                    review_payload = execution_review_payload(session.run, goal=session.request.user_request, configuration=view)
+                    decision = await review_once(run=session.run, node=node_key, kind="execution_configuration",
+                        payload=review_payload,
+                        generation=generation, eligible=eligible, bus=session.bus,
+                        blocker="；".join(view['blockers']))
+                    if decision and eligible():
+                        current = self.execution_preparations.ready_view(session.run, node_key, str(token))
+                        if current['confirmed']:
+                            return True
+                        if current['token'] != token or current['blockers']:
+                            await finish_review(session.run, session.bus, "needs_user", "审核期间实际仿真配置已变化，请重新核对。", identity=decision._identity)
+                        elif (review_payload.get('execution_preparation_evidence')
+                              and execution_review_payload(session.run, goal=session.request.user_request, configuration=current)
+                                  .get('execution_preparation_evidence') != review_payload['execution_preparation_evidence']):
+                            await finish_review(session.run, session.bus, "needs_user", "审核期间执行准备或真实预检证据已变化，请重新核对。", identity=decision._identity)
+                        elif decision.decision == "approve":
+                            await self.execution_preparations.confirm(session.run, node_key, str(token), actor='commander')
+                            saved = await self.execution_preparations.wait_confirmation(session.run, node_key)
+                            if not saved['confirmed'] or self.execution_preparations.closing or self._stopping(session):
+                                raise ValueError('配置确认未完成；尚未开始训练。')
+                            await finish_review(session.run, session.bus, "approved", decision.reason, identity=decision._identity)
+                            return True
+                        else:
+                            await finish_review(session.run, session.bus, "needs_user", decision.reason, identity=decision._identity)
+            except (OSError, ValueError, RuntimeError):
+                # A changed/unreadable input never becomes permission to launch.
+                view = {'blockers': ['仿真配置无法核验，请刷新配置核对窗口。']}
+                if session.request.review_mode == "commander":
+                    from app.bridge.managed_review import record_state, review_state
+                    state = review_state(session.run) or {}
+                    if state.get("node") != node_key or state.get("generation") != session.request.review_generation or state.get("status") != "needs_user":
+                        await record_state(session.run, session.bus, {"node": node_key, "kind": "execution_configuration",
+                            "generation": session.request.review_generation, "status": "needs_user", "reason": view['blockers'][0]})
+            if not announced:
+                self._persist_state(session, status='waiting_execution_confirmation')
+                await self._publish_state(session, channel=f'run.{session.run.run_id}.execution', payload={
+                    'event': 'execution.configuration_confirmation_required', 'node': node_key,
+                    'message': '启动仿真前，请核对实际运行环境、数据与实验参数。',
+                    'blockers': view['blockers'],
+                })
+                announced = True
+            await asyncio.sleep(interval)
+        return False
+
+    def _release_review_stop(self, session: RunSession, *, agent: str, operation: Literal["approval", "revision", "review_wait"]) -> bool:
+        """Explicit action on a durable review never replays interrupted generation."""
+        from app.harness.schema.validator import validate_document
+        from app.storage.artifact_store import ArtifactStore, SCHEMA_TO_AGENT
+
+        termination = session.termination
+        if operation == "review_wait" and (termination or {}).get("reason") != "server_shutdown":
+            return False
+        run_id = session.run.run_id
+        node_key = self._latest_node_for_stage(session, agent)
+        allowed = {NodeState.WAITING_REVIEW, NodeState.APPROVED} if operation == "approval" else {NodeState.WAITING_REVIEW}
+        if (session.read_only or self.owned_tasks.closing or self.owned_tasks.active(run_id) is not None
+                or termination is None or termination.get("type") != "cancelled"
+                or termination.get("cleanup_complete") is not True or termination.get("interrupted_nodes") != []
+                or any(state == NodeState.RUNNING or state == NodeState.FAILED and not any(
+                    edge.src == key and edge.allow_failure and session.graph.state(edge.dst) == NodeState.DONE
+                    for edge in session.graph.edges) for key, state in session.graph.all_states().items())
+                or node_key is None or session.graph.state(node_key) not in allowed):
+            return False
+        for schema, (directory, stem) in SCHEMA_TO_AGENT.items():
+            if directory != agent:
+                continue
+            versions = ArtifactStore(session.run).list_versions(agent_dir=directory, stem=stem)
+            candidates = [ref for ref in versions if (ref.version == "approved") == (operation == "approval")]
+            if not candidates:
+                continue
+            artifact = candidates[-1]
+            data = artifact.path.read_bytes()
+            result = validate_document(data.decode("utf-8"), expected_schema=schema)
+            if not result.valid or result.metadata.get("project") != session.run.project:
+                continue
+            # Preserve the old stop in the append-only lifecycle before clearing
+            # its current marker. No scheduler/start/feedback path calls this.
+            session.run.write_event("run_lifecycle", {
+                "event": f"run.{operation}_resumed", "run_id": run_id, "node": node_key,
+                "previous_termination": dict(termination),
+                ("approved_artifact" if operation == "approval" else "source_artifact"): artifact.path.relative_to(session.run.root).as_posix(),
+                ("approved_sha256" if operation == "approval" else "source_sha256"): hashlib.sha256(data).hexdigest(),
+                "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            })
+            session.termination = None
+            try:
+                self._persist_state(session, status="waiting_review")
+            except Exception:
+                session.termination = termination
+                raise
+            self.owned_tasks.release_after_explicit_review(run_id)
+            return True
+        return False
+
+    async def resume_after_artifact_approval(
+        self,
+        *,
+        run_id: str,
+        agent: str,
+    ) -> dict[str, Any]:
+        """Recover orchestration when an approval arrives without ReviewSession.
+
+        ReviewSession is in-memory. After a backend restart the artifact
+        approval endpoint can still durably promote ``*.approved.md``, but no
+        event exists to wake the original HITL wait. This method advances the
+        matching waiting node and starts the downstream scheduler.
+        """
+        session = self.session(run_id)
+        if session.read_only:
+            return {"ok": False, "status": "read_only", "run_id": run_id}
+        if self.owned_tasks.closing:
+            return {"ok": False, "status": "stopped_run_requires_new_execution", "run_id": run_id}
+        if self._stopping(session) and not self._release_review_stop(session, agent=agent, operation="approval"):
+            return {"ok": False, "status": "stopped_run_requires_new_execution", "run_id": run_id}
+        if self.owned_tasks.active(run_id) is not None:
+            # The existing driver observes the ReviewSession approval event or
+            # the already-written approved artifact. Never start a second one.
+            return {"ok": True, "status": "approval_signalled", "run_id": run_id}
+        if agent == 'execution':
+            node = self._latest_node_for_stage(session, agent)
+            if node is None or session.graph.state(node) not in {
+                    NodeState.WAITING_REVIEW, NodeState.APPROVED, NodeState.DONE, NodeState.SKIPPED}:
+                return {'ok': False, 'status': 'not_resumable', 'run_id': run_id}
+        acknowledgement: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+
+        async def resume_owned() -> None:
+            try:
+                if agent == 'execution':
+                    # Confirmation and simulation can wait for minutes. HTTP
+                    # acknowledges owned scheduling, never waits for job output.
+                    acknowledgement.set_result({'ok': True, 'status': 'approval_signalled', 'run_id': run_id})
+                result = await self._resume_approved_artifact(session, agent=agent)
+                if not acknowledgement.done():
+                    acknowledgement.set_result(result)
+                if result.get("status") == "resumed" and not self._stopping(session):
+                    await self.run(run_id)
+            finally:
+                if not acknowledgement.done():
+                    acknowledgement.set_result({"ok": False, "status": "approval_resume_interrupted", "run_id": run_id})
+
+        if not self._spawn_owned(session, "approval", resume_owned):
+            return {"ok": False, "status": "not_startable", "run_id": run_id}
+        task = self.owned_tasks.active(run_id)
+        assert task is not None
+
+        def acknowledge_finished(_task: asyncio.Task[None]) -> None:
+            if not acknowledgement.done():
+                acknowledgement.set_result({"ok": False, "status": "approval_resume_interrupted", "run_id": run_id})
+
+        task.add_done_callback(acknowledge_finished)
+        # HTTP disconnects do not abandon or cancel the owned execution.
+        return await asyncio.shield(acknowledgement)
+
+    async def _resume_approved_artifact(self, session: RunSession, *, agent: str) -> dict[str, Any]:
+        run_id = session.run.run_id
+        if session.read_only:
+            return {"ok": False, "status": "read_only", "run_id": run_id}
+        if self._stopping(session):
+            return {"ok": False, "status": "stopped", "run_id": run_id}
+        node_key = self._latest_node_for_stage(session, agent)
+        if node_key is None:
+            return {"ok": False, "error": f"stage {agent} is not in this run"}
+        state = session.graph.state(node_key)
+        if state == NodeState.WAITING_REVIEW:
+            await self._transition(session, node_key, NodeState.APPROVED)
+            state = session.graph.state(node_key)
+        if state == NodeState.APPROVED:
+            await self._complete_approved_node(session, node_key)
+            state = session.graph.state(node_key)
+        if (state == NodeState.FAILED and session.graph.nodes[node_key].metadata.get('evolution_design_repair')
+                and ready_batch(session.graph, self.max_parallel_nodes)):
+            self._persist_state(session, status='running')
+            return {'ok': True, 'status': 'resumed', 'node': node_key, 'rerouted_to': 'experiment'}
+        if state not in {NodeState.DONE, NodeState.SKIPPED}:
+            return {
+                "ok": False,
+                "status": "not_resumable",
+                "node": node_key,
+                "state": state.value,
+            }
+        if not session.graph.is_complete() and not session.waiting_for_feedback:
+            self._persist_state(session, status="running")
+            return {"ok": True, "status": "resumed", "node": node_key}
+        status = "waiting_feedback" if session.waiting_for_feedback else "completed"
+        self._persist_state(session, status=status)
+        return {"ok": True, "status": status, "node": node_key}
+
+    def _auto_promote(self, session: RunSession, node_key: str) -> bool:
+        """Copy the latest <stem>.vN.md to <stem>.approved.md.
+
+        Used for the auto_approve path so downstream nodes have an upstream
+        handoff to consume.
+        """
+        stage = parse_node_key(node_key).stage
+        if not self.registry.has(stage):
+            return True
+        from app.harness.sedimentation.hooks import sediment_approved_artifact
+        from app.storage.artifact_store import ArtifactStore, SCHEMA_TO_AGENT
+
+        store = ArtifactStore(session.run)
+        for _, (dir_name, stem) in SCHEMA_TO_AGENT.items():
+            if dir_name != stage:
+                continue
+            latest = store.latest_candidate(agent_dir=dir_name, stem=stem)
+            if stage == "execution":
+                versions = [ref for ref in store.list_versions(agent_dir=dir_name, stem=stem) if ref.version != "approved"]
+                if versions:
+                    latest = versions[-1]
+            if latest is None or latest.version == "approved":
+                continue
+            from app.bridge.evaluation_service import build_artifact_evaluation_summary
+
+            evaluation_summary = build_artifact_evaluation_summary(
+                run=session.run,
+                ref=latest,
+                node_key=node_key,
+            )
+            policy = evaluation_summary.get("policy")
+            policy_summary = policy if isinstance(policy, dict) else {}
+            if (
+                policy_summary.get("auto_approval_enforced") is True
+                and policy_summary.get("auto_approval_allowed") is False
+            ):
+                session.run.write_event(
+                    "evaluation_events",
+                    {
+                        "event": "evaluation.auto_approval_blocked",
+                        "agent": stage,
+                        "node": node_key,
+                        "run_id": session.run.run_id,
+                        "artifact_ref": latest.path.relative_to(session.run.root).as_posix(),
+                        "policy": policy_summary,
+                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    },
+                )
+                return False
+            from app.harness.schema.frontmatter_parser import parse as parse_execution_manifest
+            approved = store.approve(latest)
+            if stage == "execution" and parse_execution_manifest(approved.path.read_text()).metadata.get("runtime_mode") == "deterministic":
+                # Intake is an operational manifest, not a new scientific finding to sediment.
+                return True
+            try:
+                sediment_approved_artifact(
+                    run=session.run,
+                    agent=stage,
+                    artifact_ref=approved,
+                )
+            except Exception as exc:  # pragma: no cover - auto-promote remains durable
+                logger.warning(
+                    "auto-approved artifact sedimentation failed: run={} node={} artifact={} error={}",
+                    session.run.run_id,
+                    node_key,
+                    approved.path.name,
+                    exc,
+                )
+            if stage == "writing":
+                try:
+                    from app.reporting import generate_report_bundle
+
+                    generate_report_bundle(session.run, actor="auto_approve")
+                except Exception as exc:  # pragma: no cover - report bundle is non-blocking
+                    logger.warning(
+                        "auto-approved report bundle generation failed: run={} error={}",
+                        session.run.run_id,
+                        exc,
+                    )
+            return True
+        return True
+
+    def _default_runner(self, node_key: str) -> NodeRunner:
+        from app.bridge.agent_runner import run_agent_node
+
+        async def _real(run: RunHandle, key: str) -> None:
+            session = self.session(run.run_id)
+            await run_agent_node(run, key, bus=self.bus, registry=self.registry,
+                resume_invocation=self._resume_invocations.get((run.run_id, key)),
+                predecessor_task_ids=[f"{run.run_id}:{parent}" for parent in sorted(session.graph.predecessors(key))])
+
+        return _real
+
+    def set_stage_limit(self, run_id: str, *, stop_after: str | None) -> None:
+        """Persist workflow control without changing execution or its inputs.
+
+        The async API calls this without yielding, so a coordinator cannot
+        begin a downstream node between the phase check and durable commit.
+        """
+        if stop_after not in (None, "execution"):
+            raise ValueError("目前支持在 execution 完成后停住")
+        session = self.session(run_id)
+        snapshot = RunStateStore(session.run).load()
+        reason = self._execution_boundary_reason(session, snapshot)
+        if reason:
+            raise ValueError(reason)
+        assert snapshot is not None
+        extra = snapshot.request.get('extra', {})
+        assert isinstance(extra, dict)
+        if extra.get('stop_after') == stop_after:
+            return
+        previous = session.request.extra
+        session.request.extra = {**extra, "stop_after": stop_after}
+        try:
+            # SQLite request state is authoritative for mutable flow control.
+            # Leave the original request-options input byte-exact: it is part
+            # of existing scientific confirmation/preflight fingerprints.
+            self._persist_state(session, status=snapshot.status)
+        except Exception:
+            session.request.extra = previous
+            raise
+
+    def execution_boundary(self, run_id: str) -> dict[str, Any]:
+        """Read the latest durable control without expensive input previews."""
+        session = self.session(run_id)
+        snapshot = RunStateStore(session.run).load()
+        extra = snapshot.request.get('extra', {}) if snapshot is not None else {}
+        reason = self._execution_boundary_reason(session, snapshot)
+        return {'run_id': run_id, 'project': session.run.project,
+                'stop_after_execution': isinstance(extra, dict) and extra.get('stop_after') == 'execution',
+                'can_update': reason is None, **({'reason': reason} if reason else {})}
+
+    def _execution_boundary_reason(self, session: RunSession, snapshot: RunStateSnapshot | None) -> str | None:
+        if session.read_only:
+            return '当前任务只读，不能修改阶段边界。'
+        if self.owned_tasks.closing:
+            return '服务正在关闭，请稍后重新设置阶段边界。'
+        if (snapshot is None or snapshot.migration_required
+                or not isinstance(snapshot.request.get('extra', {}), dict)):
+            return '任务状态不可核验，不能修改阶段边界。'
+        if (snapshot.revision != session.state_revision
+                or snapshot.graph.all_states() != session.graph.all_states()):
+            return '任务状态已变化，请刷新后重新设置阶段边界。'
+        key = self._latest_node_for_stage(session, 'execution')
+        if key is None:
+            return '当前任务没有仿真阶段。'
+        pending = list(session.graph.successors(key))
+        seen: set[str] = set()
+        while pending:
+            node = pending.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            if session.graph.state(node) not in {NodeState.PENDING, NodeState.SKIPPED}:
+                return '仿真后的阶段已经开始，不能追溯暂停；当前工作不会被中断。'
+            pending.extend(session.graph.successors(node))
+        return None
+
+    @staticmethod
+    def _stage_limit_reached(session: RunSession) -> bool:
+        if session.request.extra.get("stop_after") != "execution":
+            return False
+        nodes = [key for key in session.graph.nodes if parse_node_key(key).stage == "execution"]
+        latest = max(nodes, key=lambda key: parse_node_key(key).attempt) if nodes else None
+        reached = latest is not None and session.graph.state(latest) == NodeState.DONE
+        if reached:
+            session.waiting_for_feedback = True
+        return reached
+
+    async def _after_execution(self, session: RunSession, node_key: str) -> None:
+        """Let the Commander/Bridge evaluate metrics after execution.
+
+        Diagnosis is a run-level failure analysis artifact in V2, not a
+        pipeline node. In development auto-approve runs may append the repair
+        chain automatically so legacy e2e stays runnable; otherwise the run
+        pauses at waiting_feedback until a human starts the feedback loop.
+        """
+        from app.bridge.evolution_service import archive_execution_memory
+        archive_execution_memory(session.run, attempt=parse_node_key(node_key).attempt)
+        if self._stage_limit_reached(session):
+            self._persist_state(session, status="waiting_feedback")
+            await self._publish_state(session, channel=f"run.{session.run.run_id}.execution", payload={
+                "event": "execution.stage_limit_reached", "message": "仿真已完成，按要求停在结果验收；报告阶段尚未启动。"})
+            return
+        from app.bridge.evolution_service import load_evolution, record_execution
+        if load_evolution(session.run) is not None:
+            evolution_decision = record_execution(session.run, attempt=parse_node_key(node_key).attempt)
+            await self._publish_state(session, channel=f'run.{session.run.run_id}.evolution', payload={
+                'event': 'evolution.iteration_evaluated', **evolution_decision,
+                'evidence_ref': f'evolution/attempts/attempt_{parse_node_key(node_key).attempt}/evidence_card.json'})
+            if evolution_decision['continue']:
+                if session.request.review_mode == 'commander' or session.request.auto_approve:
+                    self._append_evolution_attempt(session, node_key, evolution_decision)
+                else:
+                    session.waiting_for_feedback = True
+                    self._persist_state(session, status='waiting_feedback')
+            return
+        if not self.registry.has("execution"):
+            self._persist_state(session, status="running")
+            return
+        decision = self.commander_agent.diagnose(
+            run=session.run,
+            attempt=parse_node_key(node_key).attempt,
+        )
+        if getattr(decision, "requires_human", False):
+            if session.request.review_mode == "commander":
+                from app.bridge.managed_review import record_state
+                await record_state(session.run, session.bus, {"node": node_key, "kind": "feedback", "status": "needs_user",
+                    "generation": session.request.review_generation,
+                    "reason": "仿真结果的原因归属不明确，需要你确认下一步方向；主控未自行扩展实验。"})
+            session.waiting_for_feedback = True
+            await self._publish_state(
+                session,
+                channel=f"run.{session.run.run_id}.feedback_loop",
+                payload={
+                    "event": "feedback_loop.review_required",
+                    "run_id": session.run.run_id,
+                    "from_node": node_key,
+                    "target": decision.recommended_target,
+                    "attempt": decision.next_attempt,
+                    "recommended_action": decision.recommended_action,
+                    "feedback_packet_ref": decision.feedback_packet_ref,
+                    "confidence": decision.confidence,
+                    "reason": "low_confidence_attribution",
+                },
+            )
+            self._persist_state(session, status="waiting_feedback")
+            return
+        if not decision.should_continue:
+            self._persist_state(session, status="running")
+            return
+        managed_continue = False
+        if session.request.review_mode == "commander":
+            from dataclasses import asdict
+            from app.bridge.managed_review import review_once, finish_review
+            generation = session.request.review_generation
+            def eligible() -> bool:
+                return (session.request.review_mode == "commander" and session.request.review_generation == generation
+                        and not self._stopping(session) and not session.read_only)
+            documents = {str(path.relative_to(session.run.root)): path.read_text(encoding="utf-8")
+                         for path in session.run.subdir("diagnosis").glob("*.md")}
+            review_decision = await review_once(run=session.run, node=node_key, kind="feedback",
+                payload={"goal": session.request.user_request, "diagnosis": asdict(decision), "documents": documents,
+                         "evidence_refs": ["diagnosis", *documents]}, generation=generation, eligible=eligible, bus=session.bus)
+            if review_decision and eligible():
+                managed_continue = review_decision.decision == "approve"
+                await finish_review(session.run, session.bus, "approved" if managed_continue else "needs_user", review_decision.reason, identity=review_decision._identity)
+        if not session.request.auto_approve and not managed_continue:
+            session.waiting_for_feedback = True
+            await self._publish_state(
+                session,
+                channel=f"run.{session.run.run_id}.feedback_loop",
+                payload={
+                    "event": "feedback_loop.review_required",
+                    "run_id": session.run.run_id,
+                    "from_node": node_key,
+                    "target": decision.recommended_target,
+                    "attempt": decision.next_attempt,
+                    "recommended_action": decision.recommended_action,
+                    "feedback_packet_ref": decision.feedback_packet_ref,
+                    "confidence": decision.confidence,
+                },
+            )
+            self._persist_state(session, status="waiting_feedback")
+            return
+        appended = self._append_feedback_attempt(
+            session=session,
+            from_node=node_key,
+            decision=decision,
+        )
+        if appended:
+            await self._publish_state(
+                session,
+                channel=f"run.{session.run.run_id}.feedback_loop",
+                payload={
+                    "event": "feedback_loop.appended",
+                    "run_id": session.run.run_id,
+                    "from_node": node_key,
+                    "target": decision.recommended_target,
+                    "attempt": decision.next_attempt,
+                    "feedback_packet_ref": decision.feedback_packet_ref,
+                    "confidence": decision.confidence,
+                },
+            )
+            self._persist_state(session, status="running")
+
+    def _append_evolution_attempt(self, session: RunSession, from_node: str,
+                                  decision: dict[str, Any]) -> bool:
+        attempt, target = int(decision['next_attempt']), str(decision['target'])
+        chains = {'idea': ('idea', 'experiment', 'coding', 'execution'),
+                  'experiment': ('experiment', 'coding', 'execution'),
+                  'coding': ('coding', 'execution'), 'execution': ('execution',)}
+        if target not in chains:
+            return False
+        chain = [attempt_key(stage, attempt) for stage in chains[target]]
+        if any(key in session.graph.nodes for key in chain):
+            return False
+        previous = from_node
+        failed_parent = session.graph.state(from_node) == NodeState.FAILED
+        for key in chain:
+            identity = parse_node_key(key)
+            session.graph.add_node(key, kind='agent', metadata={
+                'stage': identity.stage, 'attempt': identity.attempt, 'evolution': True})
+            session.graph.add_edge(previous, key, allow_failure=failed_parent and previous == from_node)
+            previous = key
+        if 'writing' in session.graph.nodes:
+            if failed_parent:
+                session.graph.add_edge(from_node, 'writing', allow_failure=True)
+            session.graph.add_edge(previous, 'writing')
+        session.waiting_for_feedback = False
+        self._persist_state(session, status='running')
+        return True
+
+    def _append_feedback_attempt(
+        self,
+        *,
+        session: RunSession,
+        from_node: str,
+        decision: BridgeDecision | FeedbackDecision,
+    ) -> bool:
+        attempt = decision.next_attempt
+        target = decision.recommended_target
+        if target not in {"coding", "experiment"}:
+            return False
+
+        if target == "coding":
+            chain = [
+                attempt_key("coding", attempt),
+                attempt_key("execution", attempt),
+            ]
+        else:
+            chain = [
+                attempt_key("experiment", attempt),
+                attempt_key("execution", attempt),
+            ]
+        if any(key in session.graph.nodes for key in chain):
+            return False
+
+        for key in chain:
+            identity = parse_node_key(key)
+            session.graph.add_node(
+                key,
+                kind="agent",
+                metadata={"stage": identity.stage, "attempt": identity.attempt},
+            )
+
+        prev = from_node
+        for key in chain:
+            session.graph.add_edge(prev, key)
+            prev = key
+        if "writing" in session.graph.nodes:
+            session.graph.add_edge(prev, "writing")
+        return True
+
+    async def start_feedback_loop(
+        self,
+        *,
+        run_id: str,
+        diagnosis_version: str,
+    ) -> dict[str, Any]:
+        session = self.session(run_id)
+        from app.bridge.evolution_service import load_evolution, evolution_view
+        if load_evolution(session.run) is not None:
+            if session.read_only or self._stopping(session) or self.owned_tasks.active(run_id) is not None:
+                return {'ok': False, 'status': 'run_not_available_for_evolution'}
+            view = evolution_view(session.run)
+            decision = view.get('last_decision', {}) if view is not None else {}
+            if not decision.get('continue'):
+                return {'ok': True, 'status': 'noop', 'reason': decision.get('reason', 'No measured feedback yet')}
+            source = attempt_key('execution', int(decision['next_attempt']) - 1)
+            if session.graph.state(source) not in {NodeState.DONE, NodeState.FAILED}:
+                return {'ok': False, 'status': 'execution_not_completed'}
+            appended = self._append_evolution_attempt(session, source, decision)
+            if appended:
+                self._spawn_owned(session, 'evolution', lambda: self.run(run_id))
+            return {'ok': True, 'status': 'appended' if appended else 'already_exists', **decision}
+        if session.read_only:
+            return {"ok": False, "status": "read_only", "run_id": run_id}
+        if self._stopping(session) or self.owned_tasks.closing:
+            return {"ok": False, "status": "stopped_run_requires_new_execution"}
+        if self.owned_tasks.active(run_id) is not None:
+            return {"ok": True, "status": "already_running"}
+        if NodeState.RUNNING in session.graph.all_states().values():
+            return {"ok": False, "status": "unowned_existing_execution"}
+        run = session.run
+        path = run.subdir("diagnosis") / f"diagnosis.{diagnosis_version}.md"
+        if not path.exists():
+            return {"ok": False, "error": "diagnosis not found"}
+        decision = self.commander_agent.decide_from_artifact(
+            run=run,
+            version=diagnosis_version,
+        )
+        if not decision.should_continue:
+            return {
+                "ok": True,
+                "status": "noop",
+                "reason": decision.budget_status,
+                "target": decision.recommended_target,
+            }
+        from_node = (
+            "execution"
+            if decision.next_attempt <= 2
+            else f"execution_attempt_{decision.next_attempt - 1}"
+        )
+        appended = self._append_feedback_attempt(
+            session=session,
+            from_node=from_node,
+            decision=decision,
+        )
+        if appended:
+            session.waiting_for_feedback = False
+            self._persist_state(session, status="running")
+            self._spawn_owned(session, "feedback", lambda: self.run(run_id))
+        return {
+            "ok": True,
+            "status": "appended" if appended else "already_exists",
+            "target": decision.recommended_target,
+            "attempt": decision.next_attempt,
+            "feedback_packet_ref": getattr(decision, "feedback_packet_ref", ""),
+            "confidence": getattr(decision, "confidence", 0.0),
+        }
+
+    async def request_artifact_revision(
+        self,
+        *,
+        run_id: str,
+        agent: str,
+        reason: str,
+        restart_stopped: bool = False,
+    ) -> dict[str, Any]:
+        session = self.session(run_id)
+        if session.read_only:
+            return {"ok": False, "status": "read_only", "run_id": run_id}
+        if self.owned_tasks.closing:
+            return {"ok": False, "status": "stopped_run_requires_new_execution"}
+        if self._stopping(session) and not self._release_review_stop(session, agent=agent, operation="revision"):
+            termination = session.termination or {}
+            stopped_node = self._latest_node_for_stage(session, agent)
+            if (not restart_stopped or agent not in {"idea", "experiment", "coding", "execution", "writing"} or stopped_node is None
+                    or termination.get("scope") != "owned_async_tasks" or not termination.get("cleanup_complete")
+                    or stopped_node not in termination.get("interrupted_nodes", [])
+                    or self.owned_tasks.active(run_id) is not None
+                    or session.graph.state(stopped_node) != NodeState.FAILED):
+                return {"ok": False, "status": "stopped_run_requires_new_execution"}
+            from app.bridge.research_branch import stopped_coding_retry_blocker
+            from app.execution.job_journal import stopped_execution_retry_blocker
+            try:
+                if agent in {"idea", "experiment", "writing"}:
+                    from app.bridge.stopped_draft_retry import stopped_draft_retry_blocker
+                    blocker = stopped_draft_retry_blocker(session.run, stopped_node, stage=agent,
+                        termination=termination, states={key: value.value for key, value in session.graph.all_states().items()})
+                else:
+                    blocker = (stopped_coding_retry_blocker(session.run, stopped_node) if agent == "coding"
+                               else stopped_execution_retry_blocker(session.run.root))
+            except (OSError, ValueError, KeyError) as exc:
+                blocker = str(exc)
+            if blocker:
+                return {"ok": False, "status": "recovery_blocked", "error": blocker}
+            session.run.write_event("run_lifecycle", {"event": f"run.explicit_{agent}_retry",
+                "run_id": run_id, "node": stopped_node, "previous_termination": dict(termination),
+                "reason": reason, "automatic_resume": False, "timestamp": datetime.now(tz=timezone.utc).isoformat()})
+            session.termination = None
+            try:
+                self._persist_state(session, status="failed")
+            except Exception:
+                session.termination = termination
+                raise
+            self.owned_tasks.release_after_explicit_review(run_id)
+        node_key = self._latest_node_for_stage(session, agent)
+        if node_key is None:
+            return {"ok": False, "error": f"stage {agent} is not in this run"}
+        state = session.graph.state(node_key)
+        if self.owned_tasks.active(run_id) is not None:
+            if state == NodeState.WAITING_REVIEW:
+                from app.hitl.review_session import get_registry as get_review_registry
+                review = get_review_registry().get(run_id, agent)
+                if review is not None:
+                    if not review.regenerate_event.is_set():
+                        from app.hitl.approval import request_revision
+                        await request_revision(session=review, bus=session.bus, reason=reason)
+                    return {"ok": True, "status": "revision_requested", "node": node_key}
+            return {"ok": True, "status": "already_running", "node": node_key}
+        if NodeState.RUNNING in session.graph.all_states().values():
+            return {"ok": False, "status": "unowned_existing_execution", "node": node_key,
+                    "error": "unknown historical execution is not automatically replayed"}
+        if agent == 'writing' and state == NodeState.DONE and session.graph.is_complete():
+            # Editing a completed report is a new writing-only task. Keep the
+            # old report/approval and every simulation node intact.
+            previous = node_key
+            attempt = max(parse_node_key(key).attempt for key in session.graph.nodes) + 1
+            node_key = attempt_key('writing', attempt)
+            session.graph.add_node(node_key, kind='agent', metadata={'stage': 'writing', 'attempt': attempt,
+                'report_revision': True, 'source_node': previous})
+            session.graph.add_edge(previous, node_key)
+            state = NodeState.PENDING
+            self._persist_state(session, status='running')
+        if state not in {
+            NodeState.WAITING_REVIEW,
+            NodeState.FAILED,
+            NodeState.APPROVED,
+        } and not (agent == 'writing' and state == NodeState.PENDING
+                   and session.graph.nodes[node_key].metadata.get('report_revision')):
+            return {
+                "ok": False,
+                "error": f"stage {agent} cannot be revised from {state.value}",
+                "node": node_key,
+            }
+        async def revise_owned() -> None:
+            from app.hitl.review_session import get_registry as get_review_registry
+
+            # A review object may have outlived a stopped owner. This new
+            # explicit revision replaces that wait; it is never a checkpoint replay.
+            await get_review_registry().unregister(run_id, agent)
+            await self._publish_state(session, channel=f"run.{run_id}.hitl", payload={
+                "event": "hitl.revision_requested", "agent": agent, "node": node_key,
+                "reason": reason, "fallback": True,
+            })
+            await self._run_revision_flow(session=session, node_key=node_key, reason=reason)
+
+        started = self._spawn_owned(session, "revision", revise_owned)
+        return {"ok": started, "status": "revision_started" if started else "not_startable", "node": node_key}
+
+    async def _run_revision_flow(
+        self,
+        *,
+        session: RunSession,
+        node_key: str,
+        reason: str,
+    ) -> None:
+        try:
+            if self._stopping(session):
+                return
+            retry_existing_execution = session.graph.state(node_key) == NodeState.FAILED
+            if retry_existing_execution and parse_node_key(node_key).stage == 'execution':
+                from app.bridge.execution_confirmation import renew_execution_confirmation
+                renew_execution_confirmation(session.run, node_key)
+            await self._transition(session, node_key, NodeState.RUNNING)
+            if (retry_existing_execution and parse_node_key(node_key).stage == 'execution'
+                    and (session.run.subdir('execution') / 'run_log.approved.md').is_file()
+                    and self._has_interrupted_execution_jobs(session)):
+                # Execution retries run the already-approved deterministic intake.
+                # Keep completed measurement identities while requiring a fresh
+                # confirmation decision before recovering cleaned interrupted jobs.
+                await self._transition(session, node_key, NodeState.WAITING_REVIEW)
+                await self._transition(session, node_key, NodeState.APPROVED)
+                await self._publish_state(session, channel=f'run.{session.run.run_id}.execution', payload={
+                    'event': 'execution.explicit_retry', 'node': node_key,
+                    'message': '沿用已批准执行清单；核验已完成作业，仅恢复已清理的中断作业。'})
+                await self._complete_approved_node(session, node_key, retry_interrupted_jobs=True)
+                await self.run(session.run.run_id)
+                return
+            if not await self._run_node_runner(
+                session,
+                node_key,
+                revision_reason=reason,
+            ):
+                if session.graph.nodes[node_key].metadata.get('evolution_design_repair') and ready_batch(session.graph, self.max_parallel_nodes):
+                    await self.run(session.run.run_id)
+                return
+            if session.graph.state(node_key) == NodeState.RUNNING:
+                await self._transition(session, node_key, NodeState.WAITING_REVIEW)
+            if session.graph.state(node_key) == NodeState.WAITING_REVIEW:
+                await self._await_hitl_or_auto(session, node_key)
+            if not self._stopping(session):
+                await self._complete_approved_node(session, node_key)
+                await self.run(session.run.run_id)
+        except Exception as exc:  # pragma: no cover - background safety net
+            logger.warning(
+                "artifact revision flow failed: run={} node={} error={}",
+                session.run.run_id,
+                node_key,
+                exc,
+            )
+
+    def _latest_node_for_stage(self, session: RunSession, stage: str) -> str | None:
+        candidates = [
+            key
+            for key in session.graph.nodes
+            if parse_node_key(key).stage == stage
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda key: parse_node_key(key).attempt)
+
+    @staticmethod
+    def _has_interrupted_execution_jobs(session: RunSession) -> bool:
+        from app.execution.job_journal import job_states
+        return any(row['status'] == 'interrupted' for row in job_states(session.run.root))
+
+    def _recover_session(self, run_id: str) -> RunSession | None:
+        run = self.run_store.get(run_id)
+        if run is None:
+            return None
+        check_research_run_storage_paths(run)
+        read_only = run.entrypoint not in _ORCHESTRATED_ENTRYPOINTS
+        read_only_reason = "service_owned" if read_only else None
+        snapshot = RunStateStore(run).load()
+        if snapshot is None:
+            # Artifacts are display evidence, never a durable execution checkpoint.
+            # Even a pipeline entrypoint must not promote this inferred graph.
+            read_only = True
+            read_only_reason = "missing_persisted_state" if run.entrypoint in _ORCHESTRATED_ENTRYPOINTS else "service_owned"
+            graph = self._infer_readonly_graph_from_artifacts(run)
+            for node in graph.nodes.values():
+                node.metadata.update(read_only=True, recovery_source=(
+                    "artifacts_only" if run.entrypoint in _ORCHESTRATED_ENTRYPOINTS else "external_service"))
+            request = RunRequest(
+                task=run.task,
+                project=run.project,
+                entrypoint=run.entrypoint,  # type: ignore[arg-type]
+                user_request="",
+            )
+        else:
+            if snapshot.migration_required and not read_only:
+                read_only = True
+                read_only_reason = "legacy_state_migration_required"
+            graph = snapshot.graph
+            request = RunRequest(
+                task=str(snapshot.request.get("task", run.task)),
+                project=str(snapshot.request.get("project", run.project)),
+                entrypoint=str(snapshot.request.get("entrypoint", run.entrypoint)),  # type: ignore[arg-type]
+                standalone=bool(snapshot.request.get("standalone", False)),
+                user_request=str(snapshot.request.get("user_request", "")),
+                auto_approve=bool(snapshot.request.get("auto_approve", False)),
+                review_mode="commander" if snapshot.request.get("review_mode") == "commander" else "manual",
+                review_generation=int(snapshot.request.get("review_generation", 0)),
+                extra=(
+                    dict(snapshot.request.get("extra", {}))
+                    if isinstance(snapshot.request.get("extra"), dict)
+                    else {}
+                ),
+            )
+        waiting = snapshot is not None and snapshot.status == "waiting_feedback"
+        from app.bridge.research_context import load_research_context
+
+        load_research_context(run, request.extra)
+        session = RunSession(
+            run=run,
+            graph=graph,
+            request=request,
+            bus=self.bus,
+            waiting_for_feedback=waiting,
+            read_only=read_only,
+            read_only_reason=read_only_reason,
+            termination=snapshot.termination if snapshot is not None else None,
+            state_revision=snapshot.revision if snapshot is not None else 0,
+        )
+        self._contract_execution_block(session)
+        self._sessions[run_id] = session
+        return session
+
+    def _infer_readonly_graph_from_artifacts(self, run: RunHandle) -> RunGraph:
+        from app.harness.runtime.state_machine import NodeState
+        from app.storage.artifact_store import SCHEMA_TO_AGENT
+
+        if run.entrypoint not in _ORCHESTRATED_ENTRYPOINTS:
+            return self._external_run_projection(run)
+
+        graph = (
+            build_pipeline(run.entrypoint)  # type: ignore[arg-type]
+            if run.entrypoint != "pipeline"
+            else build_pipeline("pipeline")
+        )
+        stem_by_dir = {
+            agent_dir: stem for _sid, (agent_dir, stem) in SCHEMA_TO_AGENT.items()
+        }
+        for key in graph.nodes:
+            stem = stem_by_dir.get(key)
+            if stem is None:
+                graph.restore_state(key, NodeState.PENDING)
+                continue
+            directory = run.root / key
+            if (directory / f"{stem}.approved.md").exists():
+                graph.restore_state(key, NodeState.DONE)
+            elif any(directory.glob(f"{stem}.v*.md")):
+                graph.restore_state(key, NodeState.WAITING_REVIEW)
+            else:
+                graph.restore_state(key, NodeState.PENDING)
+        return graph
+
+    def _external_run_projection(self, run: RunHandle) -> RunGraph:
+        """Project service-owned runs into the legacy read-only Run API.
+
+        Discovery and future extension services persist runs in the shared
+        ``RunStore`` but own their lifecycle outside the five-Agent graph.
+        Legacy dashboards still enumerate those records, so recovery must be
+        observable without pretending that the Orchestrator can execute them.
+        """
+
+        lifecycle = self._external_run_lifecycle(run)
+        graph = RunGraph()
+        graph.add_node(
+            run.entrypoint,
+            kind="external_service",
+            metadata={
+                "stage": run.entrypoint,
+                "attempt": 1,
+                "read_only": True,
+                "lifecycle": lifecycle,
+            },
+        )
+        graph.set_entrypoint(run.entrypoint)
+        graph.restore_state(
+            run.entrypoint,
+            _EXTERNAL_LIFECYCLE_STATES.get(lifecycle, NodeState.PENDING),
+        )
+        return graph
+
+    def _external_run_lifecycle(self, run: RunHandle) -> str:
+        discovery_root = run.root / "discovery"
+        if run.entrypoint == "model_discovery":
+            checkpoint = self._read_json_object(
+                discovery_root / "checkpoints" / "latest.json"
+            )
+            state = checkpoint.get("state")
+            if isinstance(state, dict) and state.get("lifecycle"):
+                return str(state["lifecycle"])
+            return str(checkpoint.get("status") or "created")
+
+        if run.entrypoint == "discovery_iteration":
+            link = self._read_json_object(discovery_root / "iteration_link.json")
+            parent_run_id = str(link.get("parent_run_id") or "")
+            if parent_run_id:
+                parent = self.run_store.get(parent_run_id)
+                if parent is not None:
+                    checkpoint = self._read_json_object(
+                        parent.root / "discovery" / "checkpoints" / "latest.json"
+                    )
+                    state = checkpoint.get("state")
+                    nodes = state.get("iteration_nodes") if isinstance(state, dict) else None
+                    if isinstance(nodes, list):
+                        for item in nodes:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("child_run_id") or "") == run.run_id:
+                                return str(item.get("status") or "running")
+            return str(link.get("status") or "created")
+
+        return "created"
+
+    @staticmethod
+    def _read_json_object(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _persist_state(self, session: RunSession, *, status: str, graph: RunGraph | None = None) -> None:
+        if session.read_only:
+            raise ValueError("read-only run cannot persist executable state")
+        store = RunStateStore(session.run)
+        try:
+            revision = store.write(
+                graph=graph or session.graph,
+                request={
+                    "task": session.request.task,
+                    "project": session.request.project,
+                    "entrypoint": session.request.entrypoint,
+                    "standalone": session.request.standalone,
+                    "user_request": session.request.user_request,
+                    "auto_approve": session.request.auto_approve,
+                    "review_mode": session.request.review_mode,
+                    "review_generation": session.request.review_generation,
+                    "extra": dict(session.request.extra),
+                },
+                status=status,
+                termination=session.termination,
+                expected_revision=session.state_revision,
+            )
+        except Exception:
+            # A CAS loser must not leave speculative states runnable in memory.
+            # Block the cached session until the caller explicitly reloads it.
+            session.read_only = True
+            session.read_only_reason = "state_persistence_error"
+            try:
+                snapshot = store.load()
+                if snapshot is not None:
+                    session.graph = snapshot.graph
+                    session.termination = snapshot.termination
+                    session.state_revision = snapshot.revision
+            except (OSError, ValueError):
+                pass  # Missing/corrupt authority stays blocked; do not infer state.
+            raise
+        session.state_revision = revision
+        if graph is not None:
+            # Preserve the graph object referenced by the current driver. The
+            # candidate only changes state/metadata; topology remains RunGraph's.
+            for key, node in graph.nodes.items():
+                session.graph.restore_state(key, node.state)
+                session.graph.nodes[key].metadata = deepcopy(node.metadata)
+
+    @staticmethod
+    def _persist_request_extra(run: RunHandle, extra: dict[str, Any]) -> None:
+        """Persist additive V3 request options for bridge runners and recovery."""
+
+        if not extra:
+            return
+        payload = {
+            "schema_id": "run_request_options.v1",
+            "extra": dict(extra),
+        }
+        target = run.subdir("input") / "run_request_options.v1.json"
+        from app.harness.persistence import atomic_write_json
+        atomic_write_json(target, payload)
+
+    # ----------------------------------------------------- state + emission
+
+    async def _transition(
+        self,
+        session: RunSession,
+        node_key: str,
+        new_state: NodeState,
+    ) -> None:
+        if session.read_only:
+            raise ValueError("read-only run cannot transition")
+        if session.graph.state(node_key) == new_state:
+            return
+        candidate = RunGraph.from_dict(deepcopy(session.graph.to_dict()))
+        candidate.transition(node_key, new_state)
+        # No file event, bus publication, or live-graph mutation precedes commit.
+        status = ("failed" if new_state == NodeState.FAILED
+                  and NodeState.RUNNING not in candidate.all_states().values() else "running")
+        self._persist_state(session, status=status, graph=candidate)
+        await self.replay_state_events(session.run.run_id)
+
+    async def replay_state_events(self, run_id: str) -> int:
+        """Drain committed agent_state events; duplicates retain the same ID.
+
+        This method never runs agents. A reconnect/restart can call it without
+        making a historical RUNNING node executable or changing its state.
+        """
+        session = self.session(run_id)
+        store = RunStateStore(session.run)
+        delivered = 0
+        async with session.state_event_lock:
+            for payload in store.pending_events():
+                try:
+                    session.run.write_event("agent_events", payload)
+                    await self.langgraph_runtime.emit_transition(
+                        run=session.run, bus=session.bus, node_key=payload["agent"],
+                        from_state=NodeState(payload["from_state"]), to_state=NodeState(payload["to_state"]),
+                    )
+                    TraceRecorder(session.run).record_event_ref(
+                        channel="agent_events", event="agent_state", payload=payload,
+                    )
+                    await self._publish_state(session, channel=f"run.{run_id}.agent_state", payload=payload)
+                    store.mark_published(payload["event_id"])
+                    delivered += 1
+                except Exception as exc:
+                    # The transition is committed, so delivery failure must not
+                    # turn it into a failed agent operation. Keep the outbox row.
+                    logger.warning("Committed state event pending delivery: run={} type={}", run_id, type(exc).__name__)
+                    break
+        return delivered
+
+    async def _publish_state(
+        self,
+        session: RunSession,
+        *,
+        channel: str,
+        payload: dict[str, Any],
+    ) -> None:
+        await session.bus.publish(channel, payload)
+        session.run.write_event("websocket_events", {"channel": channel, **payload})
+        TraceRecorder(session.run).record_event_ref(
+            channel=channel,
+            event=str(payload.get("event", "")),
+            payload=payload,
+        )

@@ -1,0 +1,410 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mars://schemas/proposal.v1.json",
+  "title": "Idea Agent proposal frontmatter",
+  "type": "object",
+  "required": [
+    "schema",
+    "project",
+    "agent",
+    "research_question",
+    "hypothesis",
+    "novelty"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "schema": {
+      "const": "proposal.v1"
+    },
+    "project": {
+      "type": "string",
+      "minLength": 1
+    },
+    "agent": {
+      "const": "idea"
+    },
+    "created": {
+      "type": "string"
+    },
+    "research_question": {
+      "type": "string",
+      "minLength": 8
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 8
+    },
+    "novelty": {
+      "type": "string",
+      "minLength": 8
+    },
+    "theoretical_basis": {
+      "type": "string"
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "related_literature": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "title"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "testable_predictions": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "prediction"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "prediction": {
+                "type": "string",
+                "minLength": 1
+              },
+              "metric": {
+                "type": "string"
+              },
+              "expected_direction": {
+                "type": "string"
+              },
+              "success_threshold": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "experiment_hint": {
+      "anyOf": [
+        {
+          "type": "string",
+          "minLength": 1
+        },
+        {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "variables": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "metrics": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "minimal_ablations": {
+              "type": "array",
+              "items": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "object",
+                    "additionalProperties": true
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "evidence_refs": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "ref"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "ref": {
+                "type": "string",
+                "minLength": 1
+              },
+              "kind": {
+                "type": "string"
+              },
+              "summary": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "risk_register": {
+      "type": "array",
+      "items": {
+        "anyOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "type": "object",
+            "required": [
+              "risk"
+            ],
+            "additionalProperties": true,
+            "properties": {
+              "risk": {
+                "type": "string",
+                "minLength": 1
+              },
+              "severity": {
+                "enum": [
+                  "low",
+                  "medium",
+                  "high"
+                ]
+              },
+              "mitigation": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      }
+    },
+    "downstream_requirements": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "research_artifacts": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "quality_warnings": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "debate_summary": {
+      "type": "object",
+      "properties": {
+        "rounds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "consensus": {
+          "type": "string"
+        },
+        "disagreements": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "risks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evidence_gaps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "human_summary": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 240,
+      "pattern": "^[^\\r\\n]+$"
+    },
+    "handoff": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "target_agent",
+        "scope",
+        "next_step",
+        "changes",
+        "verification_requirements",
+        "required_context"
+      ],
+      "properties": {
+        "version": {
+          "const": "idea.handoff.v1"
+        },
+        "target_agent": {
+          "const": "experiment"
+        },
+        "scope": {
+          "enum": [
+            "method_proposal",
+            "project_proposal"
+          ]
+        },
+        "next_step": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 300
+        },
+        "changes": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "target",
+              "operation",
+              "spec_ref",
+              "preserve"
+            ],
+            "properties": {
+              "target": {
+                "type": "string",
+                "minLength": 1
+              },
+              "operation": {
+                "enum": [
+                  "add",
+                  "modify",
+                  "replace",
+                  "remove"
+                ]
+              },
+              "spec_ref": {
+                "type": "string",
+                "pattern": "^/method_spec/"
+              },
+              "preserve": {
+                "type": "array",
+                "minItems": 0,
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        },
+        "verification_requirements": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "question",
+              "comparison",
+              "metric",
+              "decision_rule_ref"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "question": {
+                "type": "string",
+                "minLength": 1
+              },
+              "comparison": {
+                "type": "string",
+                "minLength": 1
+              },
+              "metric": {
+                "type": "string",
+                "minLength": 1
+              },
+              "decision_rule_ref": {
+                "const": "/decision_rule"
+              }
+            }
+          }
+        },
+        "required_context": {
+          "type": "array",
+          "minItems": 0,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "kind",
+              "description",
+              "reason",
+              "blocks_execution"
+            ],
+            "properties": {
+              "kind": {
+                "enum": [
+                  "background",
+                  "baseline_code",
+                  "data_description",
+                  "analysis_results",
+                  "metric_definition",
+                  "execution_environment",
+                  "other"
+                ]
+              },
+              "description": {
+                "type": "string",
+                "minLength": 1
+              },
+              "reason": {
+                "type": "string",
+                "minLength": 1
+              },
+              "blocks_execution": {
+                "type": "boolean"
+              },
+              "context_ref": {
+                "type": ["string", "null"],
+                "pattern": "^[A-Za-z][A-Za-z0-9_.-]{0,127}$",
+                "description": "Exact key of the supplied task input. kind is only a category. Blocking other prerequisites require this reference in new proposals."
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

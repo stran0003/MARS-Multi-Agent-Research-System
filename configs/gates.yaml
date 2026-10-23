@@ -1,0 +1,18 @@
+gates:
+  plan_finalized:
+    enabled: true
+  large_refactor:
+    enabled: true
+    files_changed_threshold: 5
+  experiment_launch:
+    enabled: true
+    gpu_hours_threshold: 12
+  conclusion_output:
+    enabled: true
+  baseline_compatibility:
+    enabled: true
+    monitored_tools:
+    - code.patch_generator
+    - code.write_file
+    - code.delete_file
+    - code.copy_yaml

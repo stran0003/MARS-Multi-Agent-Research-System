@@ -1,0 +1,19 @@
+schema: runtime.resources.v1
+limits:
+  # Optional SDK-attempt cap shared by all Agents and child tasks.
+  # null leaves this cap unset; elapsed-time and parallel-call limits still apply.
+  max_model_requests: null
+  # Historical quota values; inactive when model_usage.yaml selects statistics_only.
+  # Kept for compatibility with existing immutable accounting configuration hashes.
+  max_total_tokens: 1128000
+  max_input_tokens: 1000000
+  max_billed_output_tokens: 128000
+  max_parallel_model_calls: 2
+  max_elapsed_seconds: 5400
+  # No verified price table yet: monetary cost is unknown, never a fake zero.
+  # The requested CNY budget is frozen separately in research_task.v1.
+  max_cost: null
+# Optional explicit prices per million tokens, in one declared currency.
+# A monetary hard limit requires a matching provider/model price entry.
+currency: CNY
+prices: {}

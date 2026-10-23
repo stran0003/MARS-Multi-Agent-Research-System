@@ -44,12 +44,12 @@ export function ResearchRunWorkspace({ run, stale, onChanged }: { run: RunDetail
       </div>
     </header>
     <RunControlBar runId={run.run_id} run={run} compact showSimpleLink={false} onChange={() => void onChanged()} />
-    <EvolutionProgress key={run.run_id} run={run} onChanged={onChanged} />
+    <EvolutionProgress key={`evolution:${run.run_id}`} run={run} onChanged={onChanged} />
     <nav aria-label={ui("对话中的研究阶段")} className="flex flex-wrap gap-2">{stages.map(item => <button type="button" key={item.stage} onClick={() => setSelected(item.stage)} aria-pressed={item.stage === stage} className={`rounded-lg border px-3 py-2 text-xs ${item.stage === stage ? "border-indigo-400/60 bg-indigo-400/10 text-indigo-100" : "border-mars-border text-slate-400 hover:text-slate-200"}`}>{ui(agentLabel(item.stage))}<span className="ml-2 opacity-70">{ui(statusLabel(item.state))}</span></button>)}</nav>
     {notice ? <p role="status" className="text-sm text-indigo-200">{notice}</p> : null}
     {stage ? <ArtifactReviewDocument key={`${run.run_id}:${stage}`} run={run} stage={stage} state={state} stale={stale} advanced={`/runs/${encodeURIComponent(run.run_id)}?view=workbench&agent=${stage}`} onChanged={onChanged} onNotice={setNotice} onArtifact={receiveArtifact} expanded reviewActions={false} initiallyCollapsed /> : <p className="text-sm text-slate-400">{ui("暂无阶段文档。")}</p>}
     <ResearchReviewPrompt run={run} artifact={pendingArtifact} stale={stale} onChanged={onChanged} />
-    <ExecutionConfigurationReview key={run.run_id} run={run} runId={run.run_id} project={run.project} stale={stale} onChanged={onChanged} />
+    <ExecutionConfigurationReview key={`execution-config:${run.run_id}`} run={run} runId={run.run_id} project={run.project} stale={stale} onChanged={onChanged} />
     {run.managed_review?.kind === "feedback" && run.managed_review.reason ? <p role="status" className="rounded-lg border border-mars-border p-3 text-xs text-slate-300">{ui("主控复核：")}{run.managed_review.reason}</p> : null}
     {stage === "writing" || stages.some(item => item.stage === "writing" && item.state === "done") ? <ReportsPanel key={`reports:${run.run_id}`} runId={run.run_id} refreshKey={`${run.status}:${stages.find(item => item.stage === "writing")?.state}`} /> : null}
   </section>;

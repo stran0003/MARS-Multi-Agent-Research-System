@@ -1,4 +1,65 @@
 # Dot-sourced by Mars.ps1. An offline distribution never falls back to downloads.
+function Resolve-MarsOfflineFile {
+    param([string]$Bundle, [string]$Relative)
+    if ($Relative -notmatch '^[A-Za-z0-9_+.\-/]+$' -or $Relative.StartsWith('/') -or
+        $Relative -match '(^|/)\.{1,2}(/|$)' -or $Relative.Contains('//')) {
+        throw 'Invalid offline dependency path.'
+    }
+    $current = [IO.Path]::GetFullPath($Bundle)
+    foreach ($part in $Relative.Split('/')) {
+        $current = Join-Path $current $part
+        if ((Test-Path -LiteralPath $current) -and
+            ((Get-Item -LiteralPath $current -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw 'Offline dependency paths cannot traverse links.'
+        }
+    }
+    return $current
+}
+
+function Restore-MarsOfflineDependency {
+    param([string]$Bundle, $Entry)
+    $target = Resolve-MarsOfflineFile $Bundle ([string]$Entry.path)
+    if ((Test-Path -LiteralPath $target) -or 'parts' -notin $Entry.PSObject.Properties.Name) { return }
+    if (@($Entry.parts).Count -eq 0 -or $Entry.bytes -le 0) { throw 'Empty offline dependency parts.' }
+    # GitHub source ZIPs contain ordinary binary pieces, never Git LFS pointers.
+    # Reassemble with streaming .NET IO before the usual whole-file SHA check.
+    $partPaths = @()
+    $seen = @{}
+    $total = [long]0
+    foreach ($part in $Entry.parts) {
+        $path = Resolve-MarsOfflineFile $Bundle ([string]$part.path)
+        if ($seen.ContainsKey($path.ToLowerInvariant()) -or $part.sha256 -notmatch '^[a-f0-9]{64}$' -or
+            $part.bytes -le 0 -or -not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            (Get-Item -LiteralPath $path).Length -ne $part.bytes -or
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne $part.sha256) {
+            throw 'Offline dependency part is missing, duplicate or corrupt. Re-extract the complete package.'
+        }
+        $seen[$path.ToLowerInvariant()] = $true
+        $total += [long]$part.bytes
+        $partPaths += $path
+    }
+    if ($total -ne $Entry.bytes) { throw 'Offline dependency parts have an incorrect total size.' }
+    New-Item -ItemType Directory -Force -Path (Split-Path $target) | Out-Null
+    $temporary = $target + '.assemble-' + [guid]::NewGuid().ToString('N')
+    $output = $null
+    try {
+        $output = [IO.File]::Open($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        foreach ($path in $partPaths) {
+            $inputFile = [IO.File]::OpenRead($path)
+            try { $inputFile.CopyTo($output) } finally { $inputFile.Dispose() }
+        }
+        $output.Dispose()
+        $output = $null
+        if ((Get-FileHash -LiteralPath $temporary -Algorithm SHA256).Hash.ToLowerInvariant() -cne $Entry.sha256) {
+            throw 'Reassembled offline dependency checksum mismatch.'
+        }
+        Move-Item -LiteralPath $temporary -Destination $target
+    } finally {
+        if ($null -ne $output) { $output.Dispose() }
+        Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Read-MarsOfflineBundle {
     param([string]$Root)
     $marker = Join-Path $Root 'WINDOWS-OFFLINE.json'
@@ -21,7 +82,8 @@ function Read-MarsOfflineBundle {
             throw 'Invalid or duplicate offline dependency path.'
         }
         $seen[$entry.path.ToLowerInvariant()] = $true
-        $file = Join-Path $bundle $entry.path
+        Restore-MarsOfflineDependency $bundle $entry
+        $file = Resolve-MarsOfflineFile $bundle ([string]$entry.path)
         if (-not (Test-Path -LiteralPath $file -PathType Leaf) -or
             ((Get-Item -LiteralPath $file).Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
             (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash -ne $entry.sha256) {

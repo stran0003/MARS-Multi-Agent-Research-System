@@ -11,6 +11,8 @@
 
 包内有 Windows 专用 Python 3.11.14、Node.js、MinGit、uv、Microsoft C++ 运行库、PyTorch CPU、SciPy、Matplotlib、TensorBoard、前后端全部锁定依赖和 ZCode 3.14.5 命令运行时。默认继续使用 ZCode，不需要安装完整 ZCode 桌面客户端。
 
+本 fork 的 `windows-offline` 分支包含实际依赖字节；直接下载该分支 ZIP 也可使用。较大的依赖按普通二进制分片保存，首次双击 CMD 自动校验、合并，不需要 Git LFS 或人工拼接。也可从本仓库 Releases 下载完整 `MARS-Product-Windows-Offline.zip`，其中依赖已合并。
+
 若系统缺少 C++ 运行库，首次可能需要管理员安装权限，安装器要求重启时按提示重启后再次双击。组织的脚本/软件策略仍生效，入口不绕过策略，也不修改系统执行策略。
 
 完整包的依赖集中保存在 `dependencies/`：`offline/` 是经过校验的安装缓存，
@@ -24,9 +26,10 @@ Node 或 Git。不要单独搬运安装后的虚拟环境；需要换目录时�
 
 ## 后续只传核心更新
 
-完整依赖只需准备一次。以后双击 **`Update-MARS.cmd`** 只下载 GitHub 官方
-`windows-core` 分支的核心 ZIP。公司电脑不能访问 GitHub 时，在可联网电脑下载核心
-ZIP，复制到公司电脑后拖到 `Update-MARS.cmd`；也可拖入含 `CORE-UPDATE.json` 的目录。
+完整依赖只需准备一次。以后双击 **`Update-MARS.cmd`** 从本 fork 的最新发行页下载
+`MARS-Core-Update.zip`，地址可在 `configs/windows_native.yaml` 的 `core_update_url` 配置。
+公司电脑不能访问 GitHub 时，在可联网电脑下载同一发行页的核心 ZIP，复制到公司电脑后
+拖到 `Update-MARS.cmd`；也可拖入含 `CORE-UPDATE.json` 的目录。
 这种方式的更新、依赖检查、前端重新构建和启动均使用已有离线依赖，不访问外部安装源。
 
 更新只替换清单里的核心文件，保留 `dependencies/`、本机配置、Key、项目、数据、任务

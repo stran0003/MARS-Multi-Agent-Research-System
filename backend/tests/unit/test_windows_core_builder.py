@@ -179,3 +179,10 @@ def test_current_real_repository_manifest_accepts_legitimate_nested_state_names(
         assert 'backend/app/execution/local/runner.py' in z.namelist()
         assert any(name.startswith('backend/app/harness/tools/knowledge/') for name in z.namelist())
         assert not any(name.startswith(('dependencies/', 'runs/', 'workspace/')) for name in z.namelist())
+
+
+def test_release_manifest_covers_every_tracked_backend_runtime_module() -> None:
+    tracked = subprocess.check_output(['git', '-C', str(ROOT), 'ls-files', 'backend/app'], text=True).splitlines()
+    selected = set(CORE.source_files(ROOT))
+    missing = {name for name in tracked if name.endswith('.py')} - selected
+    assert not missing, f'Runtime modules omitted from offline/core package: {sorted(missing)}'

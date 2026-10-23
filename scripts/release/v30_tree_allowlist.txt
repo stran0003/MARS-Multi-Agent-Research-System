@@ -861,3 +861,21 @@ backend/app/bridge/managed_review_context.py
 backend/app/execution/evolution_evidence.py
 backend/app/harness/evolution.py
 docs/auto-research.md
+
+# Current Windows/ZCode execution runtime and offline acceptance tools
+backend/app/bridge/coding_execution.py
+backend/app/bridge/coding_tool_recovery.py
+backend/app/bridge/workspace_code_changes.py
+backend/app/harness/agent_loop/zcode/continuation.py
+backend/app/harness/agent_loop/zcode/managed_runtime.py
+backend/app/harness/agent_loop/zcode/workspace.py
+backend/app/harness/tools/code/file_snapshot.py
+backend/app/harness/tools/code/patch_text.py
+backend/app/harness/tools/execution/prepared_command.py
+backend/app/harness/windows_read.py
+configs/coding_execution.yaml
+configs/zcode_runtime.yaml
+deploy/windows-native/ensure_zcode.py
+deploy/windows-native/Test-NativeScripts.ps1
+posttrain/src/mars_posttrain/__init__.py
+posttrain/src/mars_posttrain/py.typed

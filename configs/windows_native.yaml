@@ -3,6 +3,7 @@ python_version: 3.11.14
 frontend_port: 3001
 backend_port: 8010
 startup_timeout_seconds: 180
+core_update_url: https://github.com/stran0003/MARS-Multi-Agent-Research-System/releases/latest/download/MARS-Core-Update.zip
 # Provider-specific defaults; explicit legacy selection never inherits a GLM name.
 api_glm_model: glm-5.3
 api_deepseek_model: deepseek-v4-pro

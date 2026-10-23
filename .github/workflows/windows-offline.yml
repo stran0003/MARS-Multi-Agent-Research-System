@@ -2,6 +2,15 @@ name: Windows offline transfer package
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the verified package and windows-offline branch
+        type: boolean
+        default: false
+      release_tag:
+        description: Versioned offline release tag
+        type: string
+        default: windows-offline-20261023
   push:
     branches: [main]
   pull_request:
@@ -21,7 +30,7 @@ on:
 jobs:
   offline:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     permissions:
       contents: read
       actions: read
@@ -68,6 +77,8 @@ jobs:
               New-Item -ItemType Directory -Path $cache -Force | Out-Null
               Copy-Item -LiteralPath "$env:RUNNER_TEMP\mars-offline\MARS-Product\dependencies\offline" -Destination $prepared -Recurse
           }
+          python scripts/release/prepare_windows_distribution.py --archive "$env:RUNNER_TEMP\mars-offline\MARS-Product-Windows-Offline.zip" --output "$env:RUNNER_TEMP\mars-distribution"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: PowerShell 5.1 syntax and filesystem contracts
         shell: powershell
         run: .\deploy\windows-native\Test-NativeScripts.ps1
@@ -80,20 +91,20 @@ jobs:
           $env:HTTP_PROXY = 'http://127.0.0.1:9'
           $env:HTTPS_PROXY = 'http://127.0.0.1:9'
           $env:NO_PROXY = '127.0.0.1,localhost'
-          & "$env:RUNNER_TEMP\mars-offline\MARS-Product\deploy\windows-native\Mars.ps1" -Action Install
+          cmd.exe /d /c "call `"$env:RUNNER_TEMP\mars-distribution\install-mars-windows.cmd`" < nul"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Real CPU tasks, descendants, deadlines and stop after owner exit
         shell: powershell
         run: |
-          $root = "$env:RUNNER_TEMP\mars-offline\MARS-Product"
+          $root = "$env:RUNNER_TEMP\mars-distribution"
           $env:MARS_RUNTIME_ROOT = $root
           $env:PYTHONPATH = "$root\backend"
-          & "$root\dependencies\windows\venv\Scripts\python.exe" -m pytest backend/tests/unit/test_local_durable_runner.py -q
+          & "$root\dependencies\windows\venv\Scripts\python.exe" -m pytest backend/tests/unit/test_local_durable_runner.py backend/tests/unit/test_windows_offline_distribution.py -q
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Actual offline frontend, API proxy, ZCode readiness and repeated startup
         shell: powershell
         run: |
-          $root = "$env:RUNNER_TEMP\mars-offline\MARS-Product"
+          $root = "$env:RUNNER_TEMP\mars-distribution"
           $env:MARS_RUNTIME_ROOT = $root
           cmd.exe /d /c "call `"$root\MARS-Windows.cmd`" -NoBrowser -SkipConfigure < nul"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -104,12 +115,13 @@ jobs:
           & "$root\deploy\windows-native\Mars.ps1" -Action Start -NoBrowser -SkipConfigure
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           @{ first_install_offline = $true; windows_x64 = $true; actual_cpu_tasks_checked = $true;
+             git_binary_pieces_reassembled_and_verified = $true;
              frontend_proxy_checked = $true; repeated_start_checked = $true; model_requests = 0;
              full_research_model_run_checked = $false } | ConvertTo-Json | Set-Content "$root\WINDOWS-VERIFICATION.json" -Encoding UTF8
       - name: Actual offline core update retains dependencies, configuration and research data
         shell: powershell
         run: |
-          $root = "$env:RUNNER_TEMP\mars-offline\MARS-Product"
+          $root = "$env:RUNNER_TEMP\mars-distribution"
           $python = "$root\dependencies\windows\venv\Scripts\python.exe"
           $original = "$env:RUNNER_TEMP\MARS-Core-Original.zip"
           $changed = "$env:RUNNER_TEMP\MARS-Core-Changed.zip"
@@ -189,22 +201,91 @@ jobs:
         if: always()
         shell: powershell
         run: |
-          $script = "$env:RUNNER_TEMP\mars-offline\MARS-Product\deploy\windows-native\Mars.ps1"
+          $script = "$env:RUNNER_TEMP\mars-distribution\deploy\windows-native\Mars.ps1"
           if (Test-Path $script) { & $script -Action Stop }
+      - name: Prepare public verified ZIP and matching core update
+        shell: powershell
+        run: |
+          $root = "$env:RUNNER_TEMP\mars-distribution"
+          $archive = "$env:RUNNER_TEMP\mars-offline\MARS-Product-Windows-Offline.zip"
+          $env:MARS_VERIFIED_DISTRIBUTION = $root
+          $env:MARS_VERIFIED_ARCHIVE = $archive
+          @'
+          import hashlib, os, zipfile
+          from pathlib import Path
+          root = Path(os.environ['MARS_VERIFIED_DISTRIBUTION'])
+          archive = Path(os.environ['MARS_VERIFIED_ARCHIVE'])
+          with zipfile.ZipFile(archive, 'a', zipfile.ZIP_DEFLATED) as package:
+              for name in ('WINDOWS-VERIFICATION.json', 'CORE-UPDATE-VERIFICATION.json'):
+                  package.write(root / name, 'MARS-Product/' + name)
+          with archive.open('rb') as stream:
+              checksum = hashlib.file_digest(stream, 'sha256').hexdigest()
+          (archive.parent / 'SHA256SUMS.txt').write_text(checksum + '  ' + archive.name + '\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python scripts/release/build_windows_core.py --source $env:GITHUB_WORKSPACE --output "$env:RUNNER_TEMP\mars-offline\MARS-Core-Update.zip" --version $env:GITHUB_SHA
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Preserve verification evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: windows-offline-verification
           path: |
-            ${{ runner.temp }}/mars-offline/MARS-Product/local/windows/logs/
-            ${{ runner.temp }}/mars-offline/MARS-Product/WINDOWS-VERIFICATION.json
-            ${{ runner.temp }}/mars-offline/MARS-Product/CORE-UPDATE-VERIFICATION.json
+            ${{ runner.temp }}/mars-distribution/local/windows/logs/
+            ${{ runner.temp }}/mars-distribution/WINDOWS-VERIFICATION.json
+            ${{ runner.temp }}/mars-distribution/CORE-UPDATE-VERIFICATION.json
           if-no-files-found: ignore
       - name: Verified source and dependency package
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: mars-windows-offline-package
-          path: ${{ runner.temp }}/mars-offline/MARS-Product-Windows-Offline.zip
+          path: |
+            ${{ runner.temp }}/mars-offline/MARS-Product-Windows-Offline.zip
+            ${{ runner.temp }}/mars-offline/MARS-Core-Update.zip
+            ${{ runner.temp }}/mars-offline/SHA256SUMS.txt
           compression-level: 0
+
+  publish:
+    needs: offline
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.repository == 'stran0003/MARS-Multi-Agent-Research-System'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: mars-windows-offline-package
+          path: ${{ runner.temp }}/verified-offline
+      - name: Publish actual dependency bytes on windows-offline and attach full ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^windows-offline-[0-9]{8}(-[0-9]+)?$ ]]
+          cd "$RUNNER_TEMP/verified-offline"
+          sha256sum --check SHA256SUMS.txt
+          python "$GITHUB_WORKSPACE/scripts/release/prepare_windows_distribution.py" --archive MARS-Product-Windows-Offline.zip --output "$RUNNER_TEMP/windows-publication"
+          gh auth setup-git
+          cd "$RUNNER_TEMP/windows-publication"
+          git init -b windows-offline
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          remote="https://github.com/$GITHUB_REPOSITORY.git"
+          git remote add origin "$remote"
+          old=$(git ls-remote origin refs/heads/windows-offline | cut -f1)
+          parent="$GITHUB_SHA"
+          if [ -n "$old" ]; then parent="$old"; fi
+          git fetch --depth=1 origin "$parent"
+          git add --force --all
+          tree=$(git write-tree)
+          commit=$(printf 'Verified Windows offline %s (source %s)\n' "$RELEASE_TAG" "$GITHUB_SHA" | git commit-tree "$tree" -p "$parent")
+          git update-ref refs/heads/windows-offline "$commit"
+          git push origin HEAD:refs/heads/windows-offline
+          cd "$RUNNER_TEMP/verified-offline"
+          printf 'Windows x64 CPU offline package. Extract MARS-Product and double-click MARS-Windows.cmd. Python, Node, Git, PyTorch CPU, ZCode and locked Python/npm dependencies are included. Configure your own model API in Settings.\n\nVerified on a fresh Windows runner with dependency clients offline and external proxies disabled: install, real CPU process lifecycle tests, ZCode protocol, frontend/project APIs, repeated start and two core updates. No model requests or scientific training.\n\nSource commit: %s\nDependency branch: https://github.com/%s/tree/windows-offline\n' "$GITHUB_SHA" "$GITHUB_REPOSITORY" > release-notes.txt
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title "MARS Windows offline $RELEASE_TAG" --notes-file release-notes.txt MARS-Product-Windows-Offline.zip MARS-Core-Update.zip SHA256SUMS.txt

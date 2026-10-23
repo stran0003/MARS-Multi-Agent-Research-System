@@ -112,7 +112,11 @@ try {
         $part = $Source + '.' + [guid]::NewGuid().ToString('N') + '.part'
         try {
             Write-Host 'Downloading the MARS core only. Python, Node and installed dependencies are retained.'
-            Invoke-WebRequest -UseBasicParsing -Uri 'https://github.com/HarryYangthu/MARS-Multi-Agent-Research-System/archive/refs/heads/windows-core.zip' -OutFile $part -TimeoutSec 600
+            $coreUrl = if ($config.ContainsKey('core_update_url')) { $config.core_update_url } else {
+                'https://github.com/HarryYangthu/MARS-Multi-Agent-Research-System/archive/refs/heads/windows-core.zip'
+            }
+            if (-not $coreUrl.StartsWith('https://')) { throw 'Core updates require an HTTPS source.' }
+            Invoke-WebRequest -UseBasicParsing -Uri $coreUrl -OutFile $part -TimeoutSec 600
             Move-Item -LiteralPath $part -Destination $Source -Force
         } finally { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
     }

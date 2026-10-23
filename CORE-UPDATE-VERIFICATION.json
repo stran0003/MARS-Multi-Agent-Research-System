@@ -1,0 +1,48 @@
+﻿{
+    "dependency_reinstall":  false,
+    "protected_files":  {
+                            "dependencies/windows/venv/Lib/site-packages/filelock/__init__.py":  {
+                                                                                                     "sha256":  "644857D02A33BD1C45430B26F1861CEAE88BBEE2187BE6A80F6D0009F8F28B38",
+                                                                                                     "write_ticks":  639283522644789224
+                                                                                                 },
+                            "WINDOWS-OFFLINE.json":  {
+                                                         "sha256":  "5EE1876E836AA289332FE4824E67B19C84CCDA423964D7D91B5E12396270C96B",
+                                                         "write_ticks":  639283522398898042
+                                                     },
+                            "dependencies/windows/installed.json":  {
+                                                                        "sha256":  "2636570E5BB169D4795DE1F4D0B8B4E66B20966D43F9E660E23181926DD215C4",
+                                                                        "write_ticks":  639283523417521880
+                                                                    },
+                            "workspace/ci-existing-data.txt":  {
+                                                                   "sha256":  "1B9E1CF13E71E5FB3D8694700101FAEAE26A40F82F3D6AA3D0FF5E0DD9F54B57",
+                                                                   "write_ticks":  639283524050360294
+                                                               },
+                            "runs/ci-existing-result/preserved.txt":  {
+                                                                          "sha256":  "1B9E1CF13E71E5FB3D8694700101FAEAE26A40F82F3D6AA3D0FF5E0DD9F54B57",
+                                                                          "write_ticks":  639283524050360294
+                                                                      },
+                            "dependencies/windows/venv/Scripts/python.exe":  {
+                                                                                 "sha256":  "16AF6A9790D9782F8AA4DB8E3DDD3EDD4AD978FC57B77C521AE6BFED67A88049",
+                                                                                 "write_ticks":  638396640000000000
+                                                                             },
+                            "projects/ci-existing-project/preserved.txt":  {
+                                                                               "sha256":  "1B9E1CF13E71E5FB3D8694700101FAEAE26A40F82F3D6AA3D0FF5E0DD9F54B57",
+                                                                               "write_ticks":  639283524050360294
+                                                                           },
+                            "dependencies/offline/manifest.json":  {
+                                                                       "sha256":  "5BC688D00444D5BE8B4756E36129D223172A76EEB1911531584382BBBF56C69E",
+                                                                       "write_ticks":  639283522398877735
+                                                                   },
+                            "configs/models.yaml":  {
+                                                        "sha256":  "E50F14CA8D08ABF616201BAEECBB79D9BA72EE7999E71DBED9C52C5F8E376B58",
+                                                        "write_ticks":  639283524050388290
+                                                    }
+                        },
+    "real_research_training_checked":  false,
+    "original_build_id":  "8uNa_feoAJNDtEmJ-b2wJ",
+    "frontend_rebuild_and_served_source_verified":  true,
+    "core_updates_offline":  2,
+    "windows_x64":  true,
+    "model_requests":  0,
+    "changed_build_id":  "6tL7qX6GB7S6F1RlNRHLU"
+}

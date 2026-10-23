@@ -136,7 +136,12 @@ def repair_record(run: RunHandle, graph: RunGraph, node: str, error: str, *,
     else:
         evidence = verified_failures(run, parse_node_key(node).attempt)
     changes = run.root / 'input/research_changes.json'
-    signature = digest({'error': error, 'changes': _hash(changes) if changes.is_file() else source['artifact_sha256']})
+    from app.harness.tools.project_repo import load_run_project_repo
+    from app.harness.tools.git_branch import git
+    repo = load_run_project_repo(run.project, run.root, run.run_id)
+    revision = (git(repo.root, 'rev-parse', 'HEAD') if (repo.root / '.git').exists()
+                else _hash(changes) if changes.is_file() else source['artifact_sha256'])
+    signature = digest({'error': error, 'code_revision': revision, 'artifact': source['artifact_sha256']})
     if any(item.metadata.get('coding_execution_failure_signature') == signature for item in repairs):
         raise ValueError('相同输入再次出现相同失败，已停止自动重试。')
     attempt = max(parse_node_key(key).attempt for key in graph.nodes) + 1

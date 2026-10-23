@@ -7,9 +7,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from copy import deepcopy
+import ast
 import hashlib
 import json
 import math
+import re
 import asyncio
 from pathlib import Path, PureWindowsPath
 from fnmatch import fnmatchcase
@@ -163,6 +165,22 @@ def _bound_workspace(job: LocalCommandJob) -> tuple[Path | None, Path | None]:
     return code_root, project_path.resolve() if project_path.is_dir() else None
 
 
+def _references_source(argument: str, source: Path) -> bool:
+    """Recognize literal shared paths, including Python-escaped Windows strings."""
+    candidates = [argument]
+    try:
+        candidates.extend(node.value for node in ast.walk(ast.parse(argument))
+                          if isinstance(node, ast.Constant) and isinstance(node.value, str))
+    except (SyntaxError, ValueError):
+        pass
+    needle = source.as_posix().rstrip('/')
+    if source.drive:
+        needle = needle.casefold()
+    pattern = re.compile(re.escape(needle) + r'''(?=/|['"\s]|$)''')
+    return any(pattern.search(value.replace('\\', '/').casefold() if source.drive
+                              else value.replace('\\', '/')) is not None for value in candidates)
+
+
 def _command(job: LocalCommandJob, tool_name: str, *, validation: bool = False) -> tuple[tuple[str, ...], tuple[str, ...], float]:
     cfg = load_execution_config()['execution']
     selected = _registered_command(job)
@@ -209,7 +227,7 @@ def _command(job: LocalCommandJob, tool_name: str, *, validation: bool = False) 
             elif path.is_absolute() and path.is_relative_to(branch.source_root):
                 path = safe_scope_path(branch.root, path.relative_to(branch.source_root).as_posix(), must_exist=True)
                 argument = str(path)
-            elif str(branch.source_root) in argument:
+            elif _references_source(argument, branch.source_root):
                 raise ValueError("启动命令包含共享代码仓路径，请改用 MARS_CODE_ROOT 或 {code_root} 绑定本研究代码。")
         routed.append(argument)
     from app.harness.tools.check_interpreter import check_argv

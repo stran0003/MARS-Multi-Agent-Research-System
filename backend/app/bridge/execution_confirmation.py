@@ -15,6 +15,7 @@ from app.bridge.node_key import parse_node_key
 from app.harness.agent_loop.trace import digest
 from app.harness.llm.accounting import RunModelBudget, charged_model_attempts
 from app.harness.persistence import atomic_write_json, path_lock
+from app.harness.runtime.project_scope import forbidden_source_path, safe_scope_path
 from app.harness.schema.frontmatter_parser import parse
 from app.harness.tools.config import load_execution_config
 from app.harness.tools.git_branch import _load as load_branch_receipt, current_git_branch, receipt_path
@@ -200,10 +201,15 @@ def execution_preview(run: RunHandle, node_key: str) -> dict[str, Any]:
             if not isinstance(item, dict):
                 raise ValueError('代码产物的改动列表无法校验')
             name = str(item.get('path', ''))
-            path = (branch.root / name).resolve()
-            if (not name or not path.is_relative_to(branch.root.resolve())
-                    or any(part.startswith('.') for part in Path(name).parts)):
-                raise ValueError('代码产物包含越界路径')
+            # Dotfiles such as .gitignore are ordinary source files. Reuse the
+            # shared boundary checks instead of equating a leading dot with
+            # traversal; Git controls and credentials remain excluded.
+            if forbidden_source_path(name):
+                raise ValueError('代码产物引用了 Git 控制文件、凭据或运行控制文件')
+            try:
+                path = safe_scope_path(branch.root, name)
+            except ValueError as exc:
+                raise ValueError(f'代码产物路径不可用：{name}；{exc}') from exc
             files['code:' + name] = _file_hash(path)
             if path.suffix.lower() in {'.yaml', '.yml'} and path.is_file():
                 import yaml

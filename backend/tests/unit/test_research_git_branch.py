@@ -525,17 +525,18 @@ async def test_execution_uses_approved_saved_code_in_its_own_copy(research: tupl
 
 
 @pytest.mark.asyncio
-async def test_external_overwrite_is_preserved_but_not_checkpointed(research: tuple[RunHandle, Path]) -> None:
+async def test_formatter_overwrite_of_known_path_is_checkpointed_without_write_hash_gate(research: tuple[RunHandle, Path]) -> None:
     run, source = research
     with research_branch_scope(run, "coding"):
         work = load_project_repo(run.project).root; base = git(work, "rev-parse", "HEAD")
         assert (await write_file_tool({"path": "main.py", "content": "VALUE = 2\n"}, ctx(run))).ok
         (work / "main.py").write_text("EXTERNAL = True\n")
-    assert git(work, "rev-parse", "HEAD") == base and (work / "main.py").read_text() == "EXTERNAL = True\n"
+    assert git(work, "rev-parse", "HEAD") != base and (work / "main.py").read_text() == "EXTERNAL = True\n"
+    assert git(work, 'show', 'HEAD:main.py') == 'EXTERNAL = True'
     (run.root / "coding/code_spec.approved.md").write_text("---\nfiles_changed:\n- path: main.py\n  type: modified\n---\nApproval.\n")
-    with pytest.raises(GitWorkspaceError, match="写入记录不一致"):
-        with research_branch_scope(run, "execution"):
-            pytest.fail("should not enter")
+    with research_branch_scope(run, "execution"):
+        assert load_project_repo(run.project).root == work
+    assert (source / 'main.py').read_text() == 'VALUE = 1\n'
 
 
 @pytest.mark.asyncio
@@ -654,7 +655,9 @@ async def test_parallel_registered_commands_use_exact_reviewed_checkouts_and_com
         preview_argv = _command(preview_job, "execution.simulation_runner")[0]
         assert preview_argv == (sys.executable, str(checkout(task) / "main.py"))
         template = replace(preview_job, command_id="template")
-        assert _command(template, "execution.simulation_runner")[0] == preview_argv
+        template_argv = _command(template, "execution.simulation_runner")[0]
+        assert template_argv[0] == preview_argv[0]
+        assert Path(template_argv[1]).resolve() == Path(preview_argv[1]).resolve()
         with pytest.raises(ValueError, match="共享代码仓路径"):
             _command(replace(preview_job, command_id="unsafe"), "execution.simulation_runner")
 

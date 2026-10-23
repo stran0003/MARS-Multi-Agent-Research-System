@@ -7,7 +7,7 @@ from dataclasses import asdict
 
 from app.bridge.node_key import parse_node_key
 from app.harness.tools.git_branch import (
-    GitWorkspaceError, bind_git_branch, changed_files, changes_path, checkpoint_changes, git, preflight, prepare,
+    GitWorkspaceError, bind_git_branch, changed_files, checkpoint_changes, git, preflight, prepare,
     receipt_path, repository_lock,
 )
 from app.harness.tools.project_repo import load_project_repo, resolve_allowed_path
@@ -136,17 +136,15 @@ def checkpoint_approved_code(run: RunHandle) -> None:
     pending = changed_files(repo.root)
     if not pending:
         return
-    if changes_path(run.root).exists():
-        commit, files, _ = checkpoint_changes(repo.git_branch, run.root, strict=True)
-    else:
-        # Existing human-authored deliveries may predate governed write records.
-        # Preserve their explicitly approved, path-limited checkpoint behavior.
-        files = sorted(pending)
-        paths = [":(literal)" + name for name in files]
-        git(repo.root, "add", "--", *paths)
-        git(repo.root, "-c", "user.name=MARS", "-c", "user.email=mars@localhost",
-            "-c", "commit.gpgsign=false", "commit", "-m", f"Research checkpoint: {run.run_id}", "--", *paths)
-        commit = git(repo.root, "rev-parse", "HEAD")
+    # The approved manifest and actual Git diff authorize these paths. A file
+    # written by a real compiler/formatter/native tool need not invent a tool
+    # receipt just to be included in the reviewed checkpoint.
+    files = sorted(pending)
+    paths = [":(literal)" + name for name in files]
+    git(repo.root, "add", "--", *paths)
+    git(repo.root, "-c", "user.name=MARS", "-c", "user.email=mars@localhost",
+        "-c", "commit.gpgsign=false", "commit", "-m", f"Research checkpoint: {run.run_id}", "--", *paths)
+    commit = git(repo.root, "rev-parse", "HEAD")
     if commit is not None:
         run.write_event("agent_events", {"event": "coding.git_checkpoint", "agent": "coding",
             "branch": repo.git_branch.branch, "commit": commit, "files": files, "approved": True})

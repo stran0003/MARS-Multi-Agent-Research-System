@@ -202,7 +202,7 @@ class Orchestrator:
             try:
                 with research_branch_scope(session.run, node_key):
                     if not verify_written_code(session.run, text):
-                        blocker = "缺少真实代码写入记录，主控未执行或批准旧补丁，请接管审核。"
+                        blocker = "尚无与方案对应的实际代码实现，主控未执行或批准旧补丁，请接管审核。"
             except (OSError, ValueError, RuntimeError) as error:
                 blocker = f"真实代码核对未通过：{error}"
         upstream = {str(path.relative_to(session.run.root)): path.read_text(encoding="utf-8")
@@ -267,7 +267,7 @@ class Orchestrator:
             if ref.agent_dir == "coding":
                 with research_branch_scope(session.run, node_key):
                     if not verify_written_code(session.run, text):
-                        raise ValueError("真实代码写入记录未通过复核")
+                        raise ValueError("实际代码差异未通过复核")
                     await approve(session=review, bus=session.bus, actor="commander")
             else:
                 await approve(session=review, bus=session.bus, actor="commander")

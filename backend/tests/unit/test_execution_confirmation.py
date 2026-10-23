@@ -345,8 +345,10 @@ async def test_explicit_auto_mode_records_policy_confirmation(execution: tuple[O
     assert not (session.run.root / 'execution/local_commands').exists()
 
 
+@pytest.mark.parametrize('relative', ['main.py', '.gitignore', '.gitattributes', '.config/training.yaml'])
 def test_real_git_code_change_invalidates_confirmation_but_checkpoint_commit_does_not(
     execution: tuple[Orchestrator, RunSession, Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    relative: str,
 ) -> None:
     from app.bridge.research_branch import research_branch_scope
     from app.harness.project_workspace import open_folder
@@ -358,19 +360,20 @@ def test_real_git_code_change_invalidates_confirmation_but_checkpoint_commit_doe
     source = tmp_path / 'code'
     source.mkdir()
     git(source, 'init', '-b', 'baseline')
-    (source / 'main.py').write_text('VALUE = 1\n')
+    (source / relative).parent.mkdir(parents=True, exist_ok=True)
+    (source / relative).write_text('VALUE = 1\n')
     git(source, 'add', '.')
     git(source, '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '-m', 'Baseline')
     (project.metadata_root / 'repo_link.yaml').write_text(yaml.safe_dump({'repo_path': str(source),
-        'read_only': True, 'allowed_paths': ['main.py'], 'protected_paths': [], 'ignore_patterns': ['.git/']}))
+        'read_only': True, 'allowed_paths': [relative], 'protected_paths': [], 'ignore_patterns': ['.git/']}))
     run = RunStore(tmp_path / 'git-runs').create(task='real-git-confirmation', project=project.name)
     with research_branch_scope(run, 'coding'):
         candidate = load_project_repo(run.project).root
-        (candidate / 'main.py').write_text('VALUE = 2\n')
+        (candidate / relative).write_text('VALUE = 2\n')
     artifacts = ArtifactStore(run)
     artifacts.approve(artifacts.write(text=dumps({'schema': 'code_spec.v1', 'project': run.project, 'agent': 'coding',
         'target_lang': 'python', 'baseline_compat': {'preserved': True},
-        'files_changed': [{'path': 'main.py', 'type': 'modified'}]}, 'Human-authored code review.')))
+        'files_changed': [{'path': relative, 'type': 'modified'}]}, 'Human-authored code review.')))
     artifacts.approve(artifacts.write(text=dumps({'schema': 'run_log.v1', 'project': run.project, 'agent': 'execution',
         'run_id': run.run_id, 'status': 'interrupted', 'metrics': {'planned_experiments': 1}, 'fingerprint_hash': 'sha256:00',
         'planned_experiments': [{'name': 'baseline', 'config': {'command_id': 'python-environment', 'seed': 2026}}]}, 'Human-authored execution plan.')))
@@ -380,10 +383,25 @@ def test_real_git_code_change_invalidates_confirmation_but_checkpoint_commit_doe
     with research_branch_scope(run, 'execution'):
         require_confirmation(run, 'execution')
     assert execution_preview(run, 'execution')['confirmed']
-    assert git(source, 'show', 'baseline:main.py') == 'VALUE = 1'
-    assert (source / 'main.py').read_text() == 'VALUE = 1\n'
-    (candidate / 'main.py').write_text('VALUE = 3\n')
+    assert git(source, 'show', 'baseline:' + relative) == 'VALUE = 1'
+    assert (source / relative).read_text() == 'VALUE = 1\n'
+    (candidate / relative).write_text('VALUE = 3\n')
     assert not execution_preview(run, 'execution')['confirmed']
+    # Real corrupted metadata must not make preview read Git controls, secrets,
+    # absolute paths or traversal aliases, even when normal dotfiles are allowed.
+    from app.harness.schema.frontmatter_parser import parse
+    approved = run.root / 'coding/code_spec.approved.md'
+    original = approved.read_text()
+    metadata = parse(original).metadata
+    try:
+        for rejected in ['.git/config', '.env', '.ssh/id_ed25519', '.mars/control.json',
+                         '../outside.py', 'src/../main.py', 'src\\main.py', 'C:/outside.py', '/tmp/outside.py']:
+            metadata['files_changed'] = [{'path': rejected, 'type': 'modified'}]
+            approved.write_text(dumps(metadata, 'Intentionally corrupted test metadata; not an approval.'))
+            with pytest.raises(ValueError, match='代码产物'):
+                execution_preview(run, 'execution')
+    finally:
+        approved.write_text(original)
 
 
 @pytest.mark.asyncio

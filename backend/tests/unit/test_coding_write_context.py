@@ -90,7 +90,7 @@ async def test_current_tampering_is_warning_and_not_a_verified_partial_manifest(
 async def test_unchanged_rewrite_not_in_net_manifest_and_context_source_is_recorded(real_project: tuple[RunHandle, Path, ToolContext]) -> None:
     from app.harness.context.compiler import compile_agent_context
     run, root, ctx = real_project
-    (root / 'reused.yaml').write_text('value: 1\n')
+    (root / 'reused.yaml').write_text('value: 1\n', encoding='utf-8', newline='')
     result = await get_registry().dispatch('code.write_file', {'path': 'reused.yaml', 'content': 'value: 1\n'}, ctx)
     assert result.ok
     text = coding_write_context(run)

@@ -1,4 +1,4 @@
-"""Net coding changes from successful writes, checked against the bound code files."""
+"""Actual Git net changes, with receipt-based compatibility for non-Git projects."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -222,6 +222,9 @@ def completed_code_changes(run: RunHandle, *, project: str, change_id: str | Non
                     'coding_backend': actual['coding_backend'], 'artifact_version': candidates[-1][1].stem.split('.')[-1],
                     'approved': approved,
                     'historical_write_records': len(list((run.root / 'coding/tool_applications').glob('*.json')))}
+    if receipt_path(run.root).is_file():
+        from app.bridge.workspace_code_changes import workspace_code_changes
+        return workspace_code_changes(run, change_id=change_id)
     paths = sorted(p for p in (run.root / "coding/tool_applications").glob("*.json") if not p.name.startswith("rollback_"))
     if len(paths) > policy["max_scan_records"]:
         raise ValueError("改动记录超出核对范围，不能展示不完整的改动统计")

@@ -8,7 +8,7 @@ from __future__ import annotations
 from app.harness.persistence import rename_path
 
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass, replace
 import hashlib
@@ -188,16 +188,16 @@ def _changes(branch: GitBranch, run_root: Path) -> dict[str, str | None]:
         return {}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-        if (raw.get("schema_id") != "research.git_changes.v1" or raw.get("project") != branch.project
+        if (raw.get("schema_id") not in {"research.git_changes.v1", "research.git_changes.v2"} or raw.get("project") != branch.project
                 or raw.get("run_id") != branch.run_id or raw.get("repo_path") != branch.repo_path
                 or raw.get("branch") != branch.branch or not isinstance(raw.get("files"), dict)):
             raise ValueError("identity")
         files = raw["files"]
-        if any(not isinstance(name, str) or value is not None and
-               (not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None)
-               for name, value in files.items()):
-            raise ValueError("hash")
-        return dict(files)
+        if any(not isinstance(name, str) for name in files):
+            raise ValueError("path")
+        # V1 content hashes are historical audit data, not a current write
+        # grant. New records retain paths only; Git owns content versioning.
+        return {name: None for name in files}
     except (OSError, TypeError, ValueError, AttributeError) as exc:
         raise GitWorkspaceError("编码写入记录无法校验，未自动提交。", "git_workspace_identity_changed") from exc
 
@@ -211,20 +211,30 @@ def record_changed_files(project: str, run_id: str, names: list[str]) -> None:
     if owner is None or owner[0] != branch:
         raise GitWorkspaceError("编码分支缺少任务归属记录。", "git_workspace_identity_changed")
     files = _changes(branch, owner[1])
-    files.update({name: _file_hash(branch.root, name) for name in names})
-    atomic_json(changes_path(owner[1]), {"schema_id": "research.git_changes.v1",
+    files.update({name: None for name in names})
+    atomic_json(changes_path(owner[1]), {"schema_id": "research.git_changes.v2",
         "project": project, "run_id": run_id, "repo_path": branch.repo_path, "branch": branch.branch, "files": files})
 
 
 def checkpoint_changes(branch: GitBranch, run_root: Path, *, strict: bool = False) -> tuple[str | None, list[str], list[str]]:
-    """Save verified writes locally. A commit is not approval to execute them."""
+    """Save known writable paths locally, without requiring intermediate hashes.
+
+    A formatter/checker may legitimately change a written file afterward. Git
+    records that real current content; a checkpoint is never execution approval.
+    """
     branch.validate(branch.project, branch.run_id)
     pending = changed_files(branch.root)
     records = _changes(branch, run_root)
-    verified = sorted(name for name in pending if name in records and _file_hash(branch.root, name) == records[name])
+    verified = sorted(name for name in pending if name in records)
+    from app.harness.tools.project_repo import load_project_repo, resolve_allowed_path
+    active = current_git_branch(branch.project, branch.run_id)
+    with nullcontext(active) if active is not None else bind_git_branch(branch):
+        repo = load_project_repo(branch.project)
+        for name in verified:
+            resolve_allowed_path(repo, name, for_write=True)
     remaining = sorted(pending - set(verified))
     if strict and remaining:
-        raise GitWorkspaceError("代码与本任务写入记录不一致，请核对后再执行；未提交其他改动。",
+        raise GitWorkspaceError("存在尚未纳入本任务检查点的代码路径，请核对后再执行；未提交其他改动。",
                                 "git_workspace_unreviewed_changes")
     if not verified:
         return None, [], remaining
@@ -419,7 +429,7 @@ def _prepare(root: Path, run_root: Path, project: str, run_id: str) -> GitBranch
                     or raw.get("branch") != branch.branch or raw.get("project") != project or raw.get("run_id") != run_id):
                 raise GitWorkspaceError("旧编码写入记录身份不匹配，未迁移。", "git_workspace_identity_changed")
             for name, value in raw["files"].items():
-                if _file_hash(branch.root, name) != value:
+                if raw.get('schema_id') == 'research.git_changes.v1' and _file_hash(branch.root, name) != value:
                     raise GitWorkspaceError("旧编码与保存的分支不同，未迁移写入记录。", "git_workspace_identity_changed")
             if not ledger.with_name("research_changes.pre_isolation.json").exists():
                 ledger.with_name("research_changes.pre_isolation.json").write_bytes(ledger.read_bytes())

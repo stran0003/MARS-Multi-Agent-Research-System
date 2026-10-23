@@ -159,7 +159,7 @@ async def test_retry_accepts_real_prior_writes_without_replaying_or_approving_th
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", ["missing_receipt", "other_run", "snapshot_hash", "file_hash", "other_branch"])
-async def test_retry_rejects_unverified_or_unbound_prior_changes(
+async def test_retry_uses_actual_git_independent_of_old_tool_receipts(
     research: tuple[Orchestrator, RunSession, Path], case: str,
 ) -> None:
     from app.agents.base import RunRequest as AgentRequest
@@ -193,7 +193,10 @@ async def test_retry_rejects_unverified_or_unbound_prior_changes(
         if case == "other_branch":
             git(work, "switch", "-c", "unowned-test-branch")
         errors = await CodingAgent().validate_candidate(request, spec(run, [("main.py", "modified")]), [])
-        assert errors, case
+        if case == 'other_branch':
+            assert errors, case
+        else:
+            assert not errors, (case, errors)
     assert not (run.root / "coding/code_spec.approved.md").exists()
     assert not (run.root / "execution/jobs").exists()
 
@@ -248,7 +251,7 @@ async def test_real_code_checks_use_the_selected_git_in_child_commands(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["external_edit", "partial", "extra", "wrong_type", "wrong_project"])
+@pytest.mark.parametrize("case", ["partial", "extra", "wrong_type", "wrong_project"])
 async def test_partial_or_changed_code_is_not_approved(research: tuple[Orchestrator, RunSession, Path], case: str) -> None:
     _, session, source = research
     run = session.run

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import asyncio
 import json
 import os
 import subprocess
@@ -274,3 +275,62 @@ async def test_task_local_entry_survives_unbound_approval_and_execution_preview(
         assert preview['experiments'][0]['effective']['command_id'] == prepared.output['command_id']
         assert preview['experiments'][0]['effective']['validation_configured']
         assert not (run.root / 'execution/local_commands').exists()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_real_check_receipt_allows_fresh_coding_not_tool_replay(tmp_path: Path) -> None:
+    from app.bridge.coding_tool_recovery import cancelled_check_receipt
+    from app.settings import repo_root
+    with checkout(tmp_path) as (ctx, root, source):
+        marker = Path(ctx.extra['run_root']) / 'actual_checker.pid'
+        script = f'import os,time,pathlib;pathlib.Path({str(marker)!r}).write_text(str(os.getpid()));time.sleep(30)'
+        argv = [sys.executable, '-c', script]
+        tools = tmp_path / 'check-tools.yaml'
+        configuration = yaml.safe_load((repo_root() / 'configs/tools.yaml').read_text(encoding='utf-8'))
+        configuration['tools']['code.test_runner']['command_allowlist'] = [argv]
+        tools.write_text(yaml.safe_dump(configuration), encoding='utf-8')
+        (tmp_path / 'execution.yaml').write_text(yaml.safe_dump({'execution': {'local_commands': [],
+            'command_timeout_seconds': 30}, 'code_checks': {'test': {'enabled': True,
+            'commands': [{'id': 'wait-check', 'argv': argv}]}}}), encoding='utf-8')
+        with environment({'MARS_TOOLS_CONFIG_PATH': str(tools)}):
+            async def validate(text: str, history: list[dict]) -> list[str]:
+                raise AssertionError('This test never submits a model candidate')
+            run = RunHandle(ctx.run_id, Path(ctx.extra['run_root']), ctx.project, 'actual cancellation',
+                            'coding', '2026-10-23T00:00:00Z')
+            request = LoopInput(messages=[], provider=LocalVllmProvider(base_url='http://127.0.0.1:1'),
+                config=LLMConfig('local_vllm', 'unavailable'), registry=get_registry(), tool_context=ctx,
+                tools=('code.test_runner',), policy=AgentLoopPolicy(),
+                trace_root=run.root / 'agent_traces/coding/cancel-check', validate=validate)
+            config = ZCodeConfig.load()
+            state = ZCodeLoopExecutor(config)._state(request, 'cancel-check')
+            gateway = ZCodeGateway(request, config, 'local-check', state, LoopTrace(request.trace_root, 'full'))
+            task = asyncio.create_task(gateway.call_tool('mars_code__test_runner', {'command_id': 'wait-check'}))
+            try:
+                async with asyncio.timeout(30):
+                    while not marker.exists():
+                        if task.done():
+                            raise AssertionError(await task)
+                        await asyncio.sleep(.05)
+                assert not cancelled_check_receipt(run, 'cancel-check')
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert state['pending'] == 'tool'  # Original interrupted checkpoint is preserved.
+                assert cancelled_check_receipt(run, 'cancel-check')
+                records = [p for p in (run.root / 'coding/tool_applications').glob('*.json')
+                           if not p.name.startswith('rollback_')]
+                record = records[-1]
+                original = record.read_bytes()
+                tampered = json.loads(original)
+                tampered['args']['command_id'] = 'a-different-check'
+                record.write_text(json.dumps(tampered), encoding='utf-8')
+                assert not cancelled_check_receipt(run, 'cancel-check')
+                record.write_bytes(original)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                await request.provider.close()

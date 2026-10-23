@@ -42,7 +42,11 @@ def stopped_coding_retry_blocker(run: RunHandle, node_key: str) -> str:
     if not checkpoint.resolve().is_relative_to(run.root.resolve()):
         return "编码检查点路径异常。"
     state = json.loads(checkpoint.read_text())
-    if state.get("pending") == "tool" or state.get("pending_batch"):
+    if state.get('pending') == 'tool' and not state.get('pending_batch'):
+        from app.bridge.coding_tool_recovery import cancelled_check_receipt
+        if not cancelled_check_receipt(run, task.invocation_id):
+            return "有结果未确认的工具操作，不能重新执行编码阶段。"
+    elif state.get("pending_batch"):
         return "有结果未确认的工具操作，不能重新执行编码阶段。"
     from app.bridge.run_model_recovery import recover_interrupted_run_model_requests
     recovered = recover_interrupted_run_model_requests(run)

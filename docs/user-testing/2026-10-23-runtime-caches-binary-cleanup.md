@@ -38,3 +38,9 @@ For a currently absent file with valid snapshots, change accounting now uses Git
 Maintenance removed only `probe_out.txt` and `tests/tmp_probe_test.py` through the real registry, with system attribution and exact rollback snapshots. The actual user's read-only change view then returned no warnings and exactly three source additions: the adapter, YAML and smoke tests. Fresh retry eligibility was also verified. Scientific settings and original data were unchanged.
 
 Validation: all 19 completed-change regressions passed, plus one real system-cleanup boundary test (temporary addition can disappear; baseline deletion cannot be attributed to Coding). Type checking passed. Reports: `runs/generated-output-cleanup-corrected.xml` and `runs/maintenance-output-cleanup.xml`. The earlier failing test report remains preserved separately.
+
+## Deployed recovery evidence (2026-10-23, UTC+8)
+
+Runtime was fast-forwarded to `3be6a35` through the official Stop/Start flow. Health and frontend project proxy returned OK/200, with local model configuration preserved. The original stopped task was retried through its normal Coding revision API with explicit maintenance feedback, without changing approvals or scientific settings. Coding invocation `6a48cdf131f04404b93f77b6e258879a` passed with three model responses, two real checks and zero validation repairs. Commander approved `coding/code_spec.v2.md` and then the execution configuration. The new `execution_attempt_2` entered running status while the original failed execution remained in history.
+
+At 10:46, the real registered adapter launch was observed: parent MARS PID 80260, adapter wrapper PID 74740 and Python child PID 78132. Local-command job `845e59b1c33a44f4b5ef28d622bf59ed` was persisted under this run. This proves launch and recovery, not completed training or a final research result. No recurring monitor was added.
